@@ -59,6 +59,19 @@ function storageUnavailableResult(): PostbackResult {
   return { status: 503, body: { ok: false, error: "storage_unavailable" } }
 }
 
+/**
+ * Parses a DataForSEO `result[0].datetime` value, e.g. `"2026-09-21 11:00:34 +00:00"`,
+ * into an ISO-8601 instant. Returns `null` when absent or unparseable so callers can
+ * fall back to `now()`.
+ */
+function parseDataForSeoDatetime(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) return null
+  const isoish = value.trim().replace(" ", "T").replace(/\s+(?=[+-]\d{2}:\d{2}$)/, "")
+  const ms = Date.parse(isoish)
+  if (!Number.isFinite(ms)) return null
+  return new Date(ms).toISOString()
+}
+
 function isStorageError(error: unknown): error is ReviewsError {
   return (
     error instanceof ReviewsError &&
@@ -108,6 +121,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
   }
 
   function isCronAuthorized(headers: Headers): boolean {
+    if (!config.cron.secret) return false
     const authorization = headers.get("authorization")
     if (!authorization) return false
     return timingSafeEqualStrings(authorization, `Bearer ${config.cron.secret}`)
@@ -227,12 +241,13 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     const invalidItemsCount = rawItems.length - reviews.length
 
     const listingSummary = parseListingSummary(rawResult)
+    const resultAt = parseDataForSeoDatetime(rawResult.datetime) ?? nowIso()
 
     const batch: ReconciliationBatch = {
       taskId: rawTask.id,
       locationKey: location.key,
       mode,
-      resultAt: nowIso(),
+      resultAt,
       requestedDepth: depth,
       itemsCount: rawItems.length,
       reviewsCount: listingSummary.reviewsCount ?? reviews.length,
@@ -286,7 +301,11 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     contentLength?: number
   }): Promise<PostbackResult> {
     const suppliedSecrets = input.query.getAll("secret")
-    if (suppliedSecrets.length !== 1 || !timingSafeEqualStrings(suppliedSecrets[0]!, config.webhook.secret)) {
+    if (
+      !config.webhook.secret ||
+      suppliedSecrets.length !== 1 ||
+      !timingSafeEqualStrings(suppliedSecrets[0]!, config.webhook.secret)
+    ) {
       return errorResult(401, "unauthorized")
     }
 
@@ -383,7 +402,16 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
         postbackUrl,
       }))
 
-      const { accepted, rejected } = await createReviewTasks(config.dataforseo, taskRequests, fetchImpl)
+      let taskResult: Awaited<ReturnType<typeof createReviewTasks>>
+      try {
+        taskResult = await createReviewTasks(config.dataforseo, taskRequests, fetchImpl)
+      } catch (error) {
+        if (leased.size > 0) {
+          await storage.clearFullLease([...leased])
+        }
+        throw error
+      }
+      const { accepted, rejected } = taskResult
 
       await storage.recordPendingTasks(accepted)
 

@@ -1,7 +1,7 @@
 import { gzipSync } from "node:zlib"
 import { describe, expect, it, vi } from "vitest"
 import { createReviewsClient } from "../src/client.js"
-import { createEmptySnapshot } from "../src/reconcile.js"
+import { createEmptySnapshot, reconcileReviews } from "../src/reconcile.js"
 import { createStorage } from "../src/storage.js"
 import type { ReconciliationBatch, ReconciliationDecision, ReviewLocation, ReviewsConfig, ReviewsSnapshot } from "../src/types.js"
 
@@ -59,6 +59,30 @@ function baseStorage(snapshot: ReviewsSnapshot | null = null): FakeStorage {
   } satisfies FakeStorage
 }
 
+/** A storage fake that runs the real `reconcileReviews` against an in-memory
+ * snapshot, for tests that need genuine out-of-order / duplicate-task
+ * behavior rather than a canned decision. */
+function liveStorage(locations: ReviewLocation[]): FakeStorage {
+  let snapshot: ReviewsSnapshot = createEmptySnapshot("Biz", locations, NOW)
+  return {
+    readFresh: vi.fn(async () => ({ snapshot, etag: '"e"', source: "v3" as const })),
+    readForDisplay: vi.fn(async () => snapshot),
+    writeReconciled: vi.fn(async (batch: ReconciliationBatch) => {
+      const result = reconcileReviews(snapshot, batch, NOW)
+      if (result.decision === "applied") snapshot = result.snapshot
+      return { result, written: result.decision === "applied" }
+    }),
+    updateMetadata: vi.fn(async () => true),
+    acquireCronLease: vi.fn(async () => true),
+    releaseCronLease: vi.fn(async () => {}),
+    leaseFull: vi.fn(async (keys: string[]) => keys),
+    clearFullLease: vi.fn(async () => {}),
+    recordPendingTasks: vi.fn(async () => {}),
+    removePendingTask: vi.fn(async () => {}),
+    resetForTests: vi.fn(),
+  } satisfies FakeStorage
+}
+
 function baseConfig(overrides: Partial<ReviewsConfig> = {}, locations: ReviewLocation[] = [SINGLE_LOCATION]): ReviewsConfig {
   return {
     businessName: "Biz",
@@ -81,7 +105,7 @@ function gzipBytesOf(payload: unknown): Uint8Array {
   return new Uint8Array(gzipSync(Buffer.from(JSON.stringify(payload))))
 }
 
-function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag: string; place_id: string; items: unknown[]; rating: number; reviews_count: number; resultCount: number }> = {}) {
+function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag: string; place_id: string; items: unknown[]; rating: number; reviews_count: number; resultCount: number; datetime: string }> = {}) {
   const result: Record<string, unknown> = {}
   if (overrides.place_id !== undefined) result.place_id = overrides.place_id
   result.items = overrides.items ?? [
@@ -89,6 +113,7 @@ function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag:
   ]
   if (overrides.rating !== undefined) result.rating = { value: overrides.rating }
   if (overrides.reviews_count !== undefined) result.reviews_count = overrides.reviews_count
+  if (overrides.datetime !== undefined) result.datetime = overrides.datetime
 
   return {
     status_code: 20000,
@@ -495,5 +520,114 @@ describe("assertConfigured", () => {
     const cfg = baseConfig({ webhook: { secret: "s", publicBaseUrl: "http://localhost:3000" } })
     const client = createReviewsClient(cfg, { storage: fakeStorage() })
     expect(() => client.assertConfigured()).not.toThrow()
+  })
+})
+
+describe("fix round 1: resultAt uses the provider's DataForSEO datetime", () => {
+  it("uses result.datetime (space+offset format) as resultAt instead of now()", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ datetime: "2026-09-21 11:00:34 +00:00" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
+    expect(batchArg.resultAt).toBe(new Date("2026-09-21T11:00:34+00:00").toISOString())
+  })
+
+  it("falls back to now() when result.datetime is absent", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope()),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
+    expect(batchArg.resultAt).toBe(NOW)
+  })
+
+  it("falls back to now() when result.datetime is unparseable", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ datetime: "not-a-datetime" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
+    expect(batchArg.resultAt).toBe(NOW)
+  })
+
+  it("marks a recovered task with an older DataForSEO datetime than an already-applied newer postback as out_of_order", async () => {
+    const storage = liveStorage([SINGLE_LOCATION])
+    const client = createReviewsClient(baseConfig(), { storage })
+
+    const newer = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ id: "task-newer", datetime: "2026-09-21 12:00:00 +00:00" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(newer.status).toBe(200)
+    if (newer.status === 200) expect(newer.body.decision).toBe("applied")
+
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "task-older" }] }] })
+      if (url.includes("task_get")) {
+        return Response.json(taskEnvelope({ id: "task-older", datetime: "2026-09-21 11:00:00 +00:00" }))
+      }
+      if (url.includes("task_post")) return Response.json({ status_code: 20000, tasks: [] })
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+
+    const cfg = baseConfig()
+    const client2 = createReviewsClient(cfg, { storage, fetchImpl })
+    const result = await client2.runRefresh()
+
+    expect(result.recovered).toEqual([{ taskId: "task-older", locationKey: "vineland", decision: "out_of_order" }])
+  })
+})
+
+describe("fix round 1: full lease released when createReviewTasks throws", () => {
+  it("clears the leased full locations when task_post fails after leaseFull succeeded", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [] }] })
+      if (url.includes("task_post")) return new Response("server error", { status: 500 })
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const cfg = baseConfig({ sync: { fullReconciliationEnabled: true } })
+    const storage = fakeStorage()
+    const client = createReviewsClient(cfg, { storage, fetchImpl })
+
+    await expect(client.runRefresh({ forceFull: true })).rejects.toThrow()
+
+    expect(storage.leaseFull).toHaveBeenCalled()
+    expect(storage.clearFullLease).toHaveBeenCalledWith(["vineland"])
+    expect(storage.releaseCronLease).toHaveBeenCalled()
+  })
+})
+
+describe("fix round 1: empty configured secrets never authorize", () => {
+  it("isCronAuthorized rejects a matching empty Bearer header when cron.secret is empty", () => {
+    const cfg = baseConfig({ cron: { secret: "" } })
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    // A real `Headers` instance trims trailing whitespace off the value, which would
+    // make "Bearer " arrive as "Bearer" and fail on length alone — masking the bug.
+    // Use a minimal Headers-shaped stub so the exact "Bearer " (empty secret) value
+    // actually reaches the comparison.
+    const fakeHeaders = {
+      get: (name: string) => (name.toLowerCase() === "authorization" ? "Bearer " : null),
+    } as unknown as Headers
+    expect(client.isCronAuthorized(fakeHeaders)).toBe(false)
+  })
+
+  it("handlePostback rejects a matching empty ?secret= when webhook.secret is empty", async () => {
+    const cfg = baseConfig({ webhook: { secret: "", publicBaseUrl: "https://example.com" } })
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope()),
+      query: new URLSearchParams({ secret: "" }),
+    })
+    expect(result.status).toBe(401)
   })
 })
