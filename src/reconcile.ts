@@ -1,3 +1,4 @@
+import { ReviewsError } from "./errors.js"
 import type {
   GoogleReview,
   LocationSyncMetadata,
@@ -10,20 +11,12 @@ import type {
   Tombstone,
 } from "./types.js"
 
+export { ReviewsError } from "./errors.js"
+
 const REMOVAL_CONFIRMATION_MS = 7 * 24 * 60 * 60 * 1000
 const TASK_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 const TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
 const MAX_TASK_RECEIPTS = 250
-
-export class ReviewsError extends Error {
-  code: string
-
-  constructor(code: string, message?: string) {
-    super(message ?? code)
-    this.name = "ReviewsError"
-    this.code = code
-  }
-}
 
 export function getReviewKey(review: Pick<GoogleReview, "id" | "locationKey">): string {
   return `${review.locationKey}:${review.id}`
@@ -179,7 +172,7 @@ export function reconcileReviews(
     const normalizedReview: GoogleReview = {
       ...incomingReview,
       locationKey: batch.locationKey,
-      displayable: incomingReview.text.trim().length > 0,
+      displayable: true,
       pendingRemovalAt: null,
     }
     const key = getReviewKey(normalizedReview)
@@ -209,7 +202,7 @@ export function reconcileReviews(
       changes.updated += 1
     }
 
-    if (!incomingReview.displayable) changes.nonDisplayable += 1
+    if (incomingReview.text.trim().length === 0) changes.nonDisplayable += 1
   }
 
   const incompleteReason = getIncompleteReason(batch)
@@ -259,6 +252,9 @@ export function reconcileReviews(
   const overrideRating =
     isSingleLocationConfig && batch.listingRating !== undefined ? batch.listingRating : undefined
 
+  const overrideCount =
+    isSingleLocationConfig && batch.listingReviewCount !== undefined ? batch.listingReviewCount : undefined
+
   const perLocation: Record<string, LocationSyncMetadata> = {}
   for (const key of locationKeys) {
     const previous = current.metadata.perLocation[key]
@@ -267,7 +263,7 @@ export function reconcileReviews(
 
     perLocation[key] = {
       ...previous,
-      count: computed.count,
+      count: overrideCount !== undefined ? overrideCount : computed.count,
       rating: overrideRating !== undefined ? overrideRating : computed.rating,
       lastSyncMode: isBatchLocation ? batch.mode : (previous?.lastSyncMode ?? null),
       ...(isBatchLocation
@@ -279,7 +275,7 @@ export function reconcileReviews(
             reviewsCount: batch.reviewsCount,
             incompleteReason,
             ...(batch.mode === "incremental" ? { lastIncrementalAt: now } : {}),
-            ...(batch.mode === "full" ? { lastFullAttemptAt: now } : {}),
+            ...(batch.mode === "full" ? { lastFullAttemptAt: now, fullLeaseUntil: null } : {}),
             ...(completeFullSnapshot ? { lastFullReconciledAt: now } : {}),
           }
         : {}),
@@ -307,7 +303,7 @@ export function reconcileReviews(
       metadata: {
         ...current.metadata,
         averageRating: overrideRating !== undefined ? overrideRating : aggregates.averageRating,
-        totalReviews: aggregates.totalReviews,
+        totalReviews: overrideCount !== undefined ? overrideCount : aggregates.totalReviews,
         perLocation,
         lastSuccessfulWriteAt: now,
       },

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import {
   createEmptySnapshot,
+  getPublicReviews,
   getReviewKey,
   reconcileReviews,
   ReviewsError,
@@ -262,16 +263,28 @@ describe("reconcileReviews", () => {
     expect(result.snapshot.reviews[0]?.pendingRemovalAt).toBeNull()
   })
 
-  it("updates a same-ID empty-text review to non-displayable", () => {
+  it("keeps a same-ID empty-text (star-only) review displayable but flags it", () => {
     const result = reconcileReviews(
       withReviews([review("emptied")]),
       batch([review("emptied", "vineland", { text: "" })]),
       NOW,
     )
 
-    expect(result.snapshot.reviews[0]?.displayable).toBe(false)
-    expect(result.snapshot.metadata.totalReviews).toBe(0)
+    expect(result.snapshot.reviews[0]?.displayable).toBe(true)
+    expect(result.snapshot.metadata.totalReviews).toBe(1)
     expect(result.changes.nonDisplayable).toBe(1)
+  })
+
+  it("returns a star-only review from getPublicReviews only with includeStarOnly", () => {
+    const result = reconcileReviews(
+      emptySnapshot(NOW),
+      batch([review("star-only", "vineland", { text: "" })]),
+      NOW,
+    )
+
+    expect(getPublicReviews(result.snapshot)).toHaveLength(0)
+    expect(getPublicReviews(result.snapshot, { includeStarOnly: true })).toHaveLength(1)
+    expect(getPublicReviews(result.snapshot, { includeStarOnly: true })[0]?.id).toBe("star-only")
   })
 
   it("ignores older out-of-order results", () => {
@@ -352,5 +365,46 @@ describe("reconcileReviews", () => {
 
     expect(result.completeFullSnapshot).toBe(false)
     expect(result.snapshot.reviews).toContainEqual(original)
+  })
+
+  it("uses listingReviewCount as the total for a single-location config, not the stored subset", () => {
+    const solo = createEmptySnapshot("Solo Biz", [LOCATIONS[0]!], "2026-08-20T00:00:00.000Z")
+    const withStored = { ...solo, reviews: [review("a"), review("b"), review("c")] }
+
+    const result = reconcileReviews(
+      withStored,
+      batch([], {
+        taskId: "solo-listing-count",
+        mode: "incremental",
+        listingReviewCount: 4,
+      }),
+      NOW,
+    )
+
+    expect(result.snapshot.metadata.totalReviews).toBe(4)
+    expect(result.snapshot.metadata.perLocation["vineland"]?.count).toBe(4)
+  })
+
+  it("clears the location's full lease when a full batch is applied", () => {
+    const withLease = withReviews([])
+    withLease.metadata.perLocation["vineland"] = {
+      ...withLease.metadata.perLocation["vineland"]!,
+      fullLeaseUntil: "2026-08-29T00:00:00.000Z",
+    }
+
+    const result = reconcileReviews(
+      withLease,
+      batch([], {
+        taskId: "full-clears-lease",
+        mode: "full",
+        requestedDepth: 10,
+        itemsCount: 0,
+        reviewsCount: 0,
+        removalEnabled: false,
+      }),
+      NOW,
+    )
+
+    expect(result.snapshot.metadata.perLocation["vineland"]?.fullLeaseUntil).toBeNull()
   })
 })

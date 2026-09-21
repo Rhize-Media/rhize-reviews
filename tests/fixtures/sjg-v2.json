@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 2,
+  "lastUpdated": "2026-08-20T00:00:00.000Z",
+  "lastTaskIds": ["legacy-task-1"],
+  "totalReviews": 2,
+  "reviews": [
+    {
+      "id": "v2-1",
+      "location": "Vineland",
+      "content": "Great door install",
+      "date": "2026-08-15T10:00:00.000Z",
+      "time_ago": "5 days ago",
+      "author": "Alice",
+      "rating": "5",
+      "type": "google_reviews_search",
+      "review_url": "https://example.com/reviews/v2-1",
+      "owner_answer": "Thanks Alice!",
+      "original_owner_answer": null,
+      "owner_date": "2026-08-16T00:00:00.000Z",
+      "profile_image_url": "https://example.com/alice.jpg",
+      "profile_url": null,
+      "displayable": true,
+      "pendingRemovalAt": null
+    },
+    {
+      "id": "v2-2",
+      "location": "Berlin",
+      "content": "Fast service",
+      "date": "2026-08-10T10:00:00.000Z",
+      "time_ago": "10 days ago",
+      "author": "Bob",
+      "rating": "4",
+      "type": "google_reviews_search",
+      "review_url": "https://example.com/reviews/v2-2",
+      "owner_answer": null,
+      "original_owner_answer": null,
+      "owner_date": null,
+      "profile_image_url": null,
+      "profile_url": null,
+      "displayable": true,
+      "pendingRemovalAt": null
+    }
+  ],
+  "metadata": {
+    "businessName": "South Jersey Glass & Door",
+    "averageRating": 4.5,
+    "activeMaterializedReviews": 2,
+    "locationBreakdown": { "Vineland": 1, "Berlin": 1, "Glassboro": 0, "Marmora": 0, "Wildwood": 0 },
+    "lastSuccessfulWriteAt": "2026-08-20T00:00:00.000Z",
+    "locations": {
+      "Vineland": { "lastAcceptedTaskId": "legacy-task-1", "lastResultAt": "2026-08-15T10:00:00.000Z" },
+      "Berlin": { "lastAcceptedTaskId": "legacy-task-2", "lastResultAt": "2026-08-10T10:00:00.000Z" }
+    }
+  },
+  "processedTasks": [
+    {
+      "taskId": "legacy-task-1",
+      "location": "Vineland",
+      "mode": "incremental",
+      "resultAt": "2026-08-15T10:00:00.000Z",
+      "processedAt": "2026-08-15T10:05:00.000Z"
+    }
+  ],
+  "tombstones": [
+    {
+      "key": "Vineland:gone",
+      "firstMissingAt": "2026-07-01T00:00:00.000Z",
+      "lastMissingAt": "2026-07-08T00:00:00.000Z",
+      "removedAt": "2026-07-08T00:00:00.000Z",
+      "lastSourceAt": "2026-07-08T00:00:00.000Z"
+    }
+  ]
+}

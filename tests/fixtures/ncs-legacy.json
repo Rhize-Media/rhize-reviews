@@ -1,0 +1,26 @@
+{
+  "items": [
+    {
+      "id": "ncs-1",
+      "profileName": "Carol",
+      "reviewText": "Very happy with the result",
+      "timestamp": "2026-08-12T09:00:00.000Z",
+      "timeAgo": "8 days ago",
+      "rating": 5,
+      "reviewUrl": "https://example.com/reviews/ncs-1",
+      "profileImageUrl": "https://example.com/carol.jpg",
+      "ownerAnswer": "Thank you Carol!"
+    },
+    {
+      "id": "ncs-2",
+      "profileName": "Dave",
+      "reviewText": "Solid work",
+      "timestamp": "2026-08-05T09:00:00.000Z",
+      "timeAgo": "15 days ago",
+      "rating": 4
+    }
+  ],
+  "totalCount": 2,
+  "aggregateRating": 4.5,
+  "updatedAt": "2026-08-12T09:30:00.000Z"
+}
