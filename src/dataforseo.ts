@@ -33,6 +33,14 @@ export function encodeTag(locationKey: string, mode: ReviewSyncMode, depth: numb
   return `rhize-reviews:${locationKey}:${mode}:${depth}`
 }
 
+function lookupCaseInsensitive(map: Record<string, string>, name: string): string | undefined {
+  const lowered = name.toLowerCase()
+  for (const [key, value] of Object.entries(map)) {
+    if (key.toLowerCase() === lowered) return value
+  }
+  return undefined
+}
+
 export function parseTag(
   tag: string,
   legacyLocationKeys?: Record<string, string>,
@@ -53,7 +61,7 @@ export function parseTag(
   const legacyName = legacyTagged?.[1] ?? legacyBare?.[1]
   if (!legacyName) return null
 
-  const locationKey = legacyLocationKeys[legacyName.toLowerCase()]
+  const locationKey = legacyLocationKeys[legacyName] ?? lookupCaseInsensitive(legacyLocationKeys, legacyName)
   if (!locationKey) return null
 
   return {

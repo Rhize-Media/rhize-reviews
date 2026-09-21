@@ -59,6 +59,26 @@ describe("tag round-trip", () => {
     expect(parseTag("sjg-reviews-unknown", legacyLocationKeys)).toBeNull()
   })
 
+  it("looks up the legacyLocationKeys map keyed by the original SJG (capitalized) name", () => {
+    const legacyLocationKeys = {
+      Vineland: "vineland",
+      Berlin: "berlin",
+      Glassboro: "glassboro",
+      Marmora: "marmora",
+      Wildwood: "wildwood",
+    }
+    expect(parseTag("sjg-reviews:Vineland:full:100", legacyLocationKeys)).toEqual({
+      locationKey: "vineland",
+      mode: "full",
+      depth: 100,
+    })
+    expect(parseTag("sjg-reviews-Vineland", legacyLocationKeys)).toEqual({
+      locationKey: "vineland",
+      mode: "incremental",
+      depth: 10,
+    })
+  })
+
   it("returns null for legacy tags when no legacyLocationKeys map is supplied", () => {
     expect(parseTag("sjg-reviews-vineland")).toBeNull()
   })
