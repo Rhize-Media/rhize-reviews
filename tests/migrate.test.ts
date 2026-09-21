@@ -128,6 +128,64 @@ describe("migrateSnapshot", () => {
     expect(result?.tombstones).toEqual([])
   })
 
+  it("marks a star-only SJG v2 review (no text, no explicit displayable) as displayable", () => {
+    const raw = {
+      schemaVersion: 2,
+      lastUpdated: NOW,
+      totalReviews: 1,
+      reviews: [
+        {
+          id: "v2-star-only",
+          location: "Vineland",
+          content: "",
+          date: NOW,
+          author: "Eve",
+          rating: "5",
+          type: "google_reviews_search",
+        },
+      ],
+      metadata: { businessName: "Biz", locationBreakdown: { Vineland: 1 } },
+      processedTasks: [],
+      tombstones: [],
+    }
+
+    const result = migrateSnapshot(raw, {
+      businessName: "Biz",
+      locations: LOCATIONS,
+      now: NOW,
+      legacyLocationKeys: { Vineland: "vineland" },
+    })
+
+    const review = result?.reviews.find(r => r.id === "v2-star-only")
+    expect(review?.displayable).toBe(true)
+  })
+
+  it("marks a star-only NCS legacy review (empty reviewText) as displayable", () => {
+    const raw = {
+      items: [
+        {
+          id: "ncs-star-only",
+          profileName: "Frank",
+          reviewText: "",
+          timestamp: NOW,
+          rating: 5,
+        },
+      ],
+      totalCount: 1,
+      aggregateRating: 5,
+      updatedAt: NOW,
+    }
+
+    const result = migrateSnapshot(raw, {
+      businessName: "Biz",
+      locations: [LOCATIONS[0]!],
+      now: NOW,
+    })
+
+    const review = result?.reviews.find(r => r.id === "ncs-star-only")
+    expect(review?.displayable).toBe(true)
+  })
+
   it("returns null for unrecognizable input", () => {
     expect(
       migrateSnapshot(

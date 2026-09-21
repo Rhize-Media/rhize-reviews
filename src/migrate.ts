@@ -94,7 +94,7 @@ function migrateSjgV2(raw: Record<string, unknown>, ctx: MigrateContext): Review
       rating: toRating(review.rating),
       text,
       publishedAt: typeof review.date === "string" ? review.date : ctx.now,
-      displayable: typeof review.displayable === "boolean" ? review.displayable : text.trim().length > 0,
+      displayable: typeof review.displayable === "boolean" ? review.displayable : true,
       pendingRemovalAt: typeof review.pendingRemovalAt === "string" ? review.pendingRemovalAt : null,
     }
     if (typeof review.time_ago === "string") migrated.relativeTime = review.time_ago
@@ -166,7 +166,7 @@ function migrateNcsLegacy(raw: Record<string, unknown>, ctx: MigrateContext): Re
       rating: toRating(item.rating),
       text,
       publishedAt: typeof item.timestamp === "string" ? item.timestamp : ctx.now,
-      displayable: text.trim().length > 0,
+      displayable: true,
       pendingRemovalAt: null,
     }
     if (typeof item.timeAgo === "string") migrated.relativeTime = item.timeAgo
