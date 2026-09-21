@@ -1,0 +1,33 @@
+{
+  "name": "@rhize/reviews",
+  "version": "0.1.0-rc.1",
+  "description": "Google reviews pipeline for Next.js sites: DataForSEO task → postback webhook → private Vercel Blob snapshot → cached reader",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Rhize-Media/rhize-reviews.git" },
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "files": ["dist", "README.md", "LICENSE"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./next": { "types": "./dist/next/index.d.ts", "import": "./dist/next/index.js" }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.8.0",
+    "@vercel/oidc": "^3.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0"
+  },
+  "publishConfig": { "access": "public", "provenance": true }
+}
