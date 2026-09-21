@@ -38,6 +38,7 @@ export interface ReviewsClient {
   handlePostback(input: { bytes: Uint8Array; query: URLSearchParams; contentLength?: number }): Promise<PostbackResult>
   assertConfigured(): void
   isCronAuthorized(headers: Headers): boolean
+  reportError: ReviewsConfig["hooks"]["reportError"]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -443,5 +444,6 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     handlePostback,
     assertConfigured,
     isCronAuthorized,
+    reportError: config.hooks.reportError,
   }
 }

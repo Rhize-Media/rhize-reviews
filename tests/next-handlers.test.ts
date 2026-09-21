@@ -21,6 +21,7 @@ function fakeClient(overrides: Partial<ReviewsClient> = {}): ReviewsClient {
     handlePostback: vi.fn(async (_input: HandlePostbackInput) => okPostbackResult()),
     assertConfigured: vi.fn(),
     isCronAuthorized: vi.fn(() => true),
+    reportError: vi.fn(),
     ...overrides,
   }
 }
@@ -59,6 +60,7 @@ describe("refreshReviewsGET", () => {
     expect(response.status).toBe(401)
     await expect(response.json()).resolves.toEqual({ ok: false, error: "unauthorized" })
     expect(client.runRefresh).not.toHaveBeenCalled()
+    expect(client.reportError).not.toHaveBeenCalled()
   })
 
   it("returns 200 with the RefreshResult when authorized", async () => {
@@ -71,6 +73,7 @@ describe("refreshReviewsGET", () => {
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toEqual(result)
     expect(client.runRefresh).toHaveBeenCalledWith({ forceFull: false })
+    expect(client.reportError).not.toHaveBeenCalled()
   })
 
   it("passes forceFull:true when ?initial=true", async () => {
@@ -82,10 +85,11 @@ describe("refreshReviewsGET", () => {
     expect(client.runRefresh).toHaveBeenCalledWith({ forceFull: true })
   })
 
-  it("returns 503 not_configured when runRefresh throws that ReviewsError", async () => {
+  it("returns 503 not_configured when runRefresh throws that ReviewsError, and reports it", async () => {
+    const thrown = new ReviewsError("not_configured", "missing config", { missing: ["dataforseo.login"] })
     const client = fakeClient({
       runRefresh: vi.fn(async () => {
-        throw new ReviewsError("not_configured", "missing config", { missing: ["dataforseo.login"] })
+        throw thrown
       }),
     })
     const { refreshReviewsGET } = createReviewsHandlers(client)
@@ -94,12 +98,14 @@ describe("refreshReviewsGET", () => {
 
     expect(response.status).toBe(503)
     await expect(response.json()).resolves.toEqual({ ok: false, error: "not_configured", missing: ["dataforseo.login"] })
+    expect(client.reportError).toHaveBeenCalledWith(thrown, { handler: "refreshReviewsGET", code: "not_configured" })
   })
 
-  it.each(["dataforseo_billing", "dataforseo_request_failed", "task_rejected"])("returns 502 on %s", async code => {
+  it.each(["dataforseo_billing", "dataforseo_request_failed", "task_rejected"])("returns 502 on %s, and reports it", async code => {
+    const thrown = new ReviewsError(code, "upstream failure")
     const client = fakeClient({
       runRefresh: vi.fn(async () => {
-        throw new ReviewsError(code, "upstream failure")
+        throw thrown
       }),
     })
     const { refreshReviewsGET } = createReviewsHandlers(client)
@@ -107,12 +113,14 @@ describe("refreshReviewsGET", () => {
     const response = await refreshReviewsGET(new Request("https://example.com/api/reviews/refresh"))
 
     expect(response.status).toBe(502)
+    expect(client.reportError).toHaveBeenCalledWith(thrown, { handler: "refreshReviewsGET", code })
   })
 
-  it("returns 500 on unmapped errors", async () => {
+  it("returns 500 on unmapped errors, and reports it with code:\"unknown\"", async () => {
+    const thrown = new Error("boom")
     const client = fakeClient({
       runRefresh: vi.fn(async () => {
-        throw new Error("boom")
+        throw thrown
       }),
     })
     const { refreshReviewsGET } = createReviewsHandlers(client)
@@ -120,6 +128,7 @@ describe("refreshReviewsGET", () => {
     const response = await refreshReviewsGET(new Request("https://example.com/api/reviews/refresh"))
 
     expect(response.status).toBe(500)
+    expect(client.reportError).toHaveBeenCalledWith(thrown, { handler: "refreshReviewsGET", code: "unknown" })
   })
 })
 
@@ -146,6 +155,22 @@ describe("dataforseoWebhookPOST", () => {
     expect(call.contentLength).toBe(payload.length)
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({ ok: true, taskId: "t1" })
+    expect(client.reportError).not.toHaveBeenCalled()
+  })
+
+  it("returns 500 and reports the error when handlePostback itself throws", async () => {
+    const thrown = new Error("storage exploded")
+    const handlePostback = vi.fn(async (_input: HandlePostbackInput) => {
+      throw thrown
+    })
+    const client = fakeClient({ handlePostback })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const request = new Request("https://example.com/api/reviews/webhook", { method: "POST", body: "{}" })
+    const response = await dataforseoWebhookPOST(request)
+
+    expect(response.status).toBe(500)
+    expect(client.reportError).toHaveBeenCalledWith(thrown, { handler: "dataforseoWebhookPOST" })
   })
 
   it("maps a 401 unauthorized PostbackResult straight through", async () => {

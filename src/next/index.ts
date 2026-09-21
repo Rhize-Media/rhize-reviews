@@ -40,12 +40,17 @@ export function createReviewsHandlers(client: ReviewsClient): {
     } catch (error) {
       if (error instanceof ReviewsError) {
         if (error.code === "not_configured") {
+          client.reportError(error, { handler: "refreshReviewsGET", code: error.code })
           return Response.json({ ok: false, error: "not_configured", missing: error.extra?.missing }, { status: 503 })
         }
         if (GATEWAY_ERROR_CODES.has(error.code)) {
+          client.reportError(error, { handler: "refreshReviewsGET", code: error.code })
           return Response.json({ ok: false, error: error.code }, { status: 502 })
         }
+        client.reportError(error, { handler: "refreshReviewsGET", code: error.code })
+        return Response.json({ ok: false, error: "internal_error" }, { status: 500 })
       }
+      client.reportError(error, { handler: "refreshReviewsGET", code: "unknown" })
       return Response.json({ ok: false, error: "internal_error" }, { status: 500 })
     }
   }
@@ -55,12 +60,17 @@ export function createReviewsHandlers(client: ReviewsClient): {
     const query = new URL(request.url).searchParams
     const contentLength = Number(request.headers.get("content-length")) || undefined
 
-    const result = await client.handlePostback({
-      bytes,
-      query,
-      ...(contentLength !== undefined ? { contentLength } : {}),
-    })
-    return Response.json(result.body, { status: result.status })
+    try {
+      const result = await client.handlePostback({
+        bytes,
+        query,
+        ...(contentLength !== undefined ? { contentLength } : {}),
+      })
+      return Response.json(result.body, { status: result.status })
+    } catch (error) {
+      client.reportError(error, { handler: "dataforseoWebhookPOST" })
+      return Response.json({ ok: false, error: "internal_error" }, { status: 500 })
+    }
   }
 
   function dataforseoWebhookGET(): Response {

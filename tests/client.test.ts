@@ -375,6 +375,19 @@ describe("isCronAuthorized", () => {
   })
 })
 
+describe("reportError", () => {
+  it("delegates to config.hooks.reportError", () => {
+    const reportError = vi.fn()
+    const config = baseConfig({ hooks: { reportError, revalidate: vi.fn() } })
+    const client = createReviewsClient(config, { storage: fakeStorage() })
+
+    const error = new Error("boom")
+    client.reportError(error, { handler: "refreshReviewsGET" })
+
+    expect(reportError).toHaveBeenCalledWith(error, { handler: "refreshReviewsGET" })
+  })
+})
+
 describe("runRefresh", () => {
   function refreshDeps() {
     const fetchImpl = vi.fn(async (url: string) => {
