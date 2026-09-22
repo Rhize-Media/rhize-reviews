@@ -1,4 +1,6 @@
 import type { GoogleReview, LocationSyncMetadata, ReviewLocation, ReviewsSnapshot, TaskReceipt } from "./types.js"
+import { isRecord } from "./util.js"
+import { computeAggregates } from "./reconcile.js"
 
 export interface MigrateContext {
   businessName: string
@@ -7,9 +9,6 @@ export interface MigrateContext {
   legacyLocationKeys?: Record<string, string>
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
 
 function isV3Snapshot(raw: unknown): raw is ReviewsSnapshot {
   return isRecord(raw) && raw.schemaVersion === 3
@@ -29,44 +28,6 @@ function isSjgV2(raw: unknown): raw is Record<string, unknown> {
 function isNcsLegacy(raw: unknown): raw is Record<string, unknown> {
   if (!isRecord(raw)) return false
   return Array.isArray(raw.items) && typeof raw.totalCount === "number"
-}
-
-function computeAggregates(
-  reviews: GoogleReview[],
-  locationKeys: string[],
-): { totalReviews: number; averageRating: number; perLocation: Record<string, { count: number; rating: number }> } {
-  const buckets: Record<string, { count: number; sum: number; rated: number }> = {}
-  for (const key of locationKeys) buckets[key] = { count: 0, sum: 0, rated: 0 }
-
-  let totalCount = 0
-  let totalSum = 0
-  let totalRated = 0
-
-  for (const review of reviews) {
-    if (review.displayable === false) continue
-    totalCount += 1
-    totalSum += review.rating
-    totalRated += 1
-
-    const bucket = buckets[review.locationKey]
-    if (bucket) {
-      bucket.count += 1
-      bucket.sum += review.rating
-      bucket.rated += 1
-    }
-  }
-
-  const perLocation: Record<string, { count: number; rating: number }> = {}
-  for (const key of locationKeys) {
-    const bucket = buckets[key]!
-    perLocation[key] = { count: bucket.count, rating: bucket.rated > 0 ? bucket.sum / bucket.rated : 0 }
-  }
-
-  return {
-    totalReviews: totalCount,
-    averageRating: totalRated > 0 ? totalSum / totalRated : 0,
-    perLocation,
-  }
 }
 
 function toRating(value: unknown): 1 | 2 | 3 | 4 | 5 {

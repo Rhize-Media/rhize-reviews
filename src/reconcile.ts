@@ -11,7 +11,6 @@ import type {
   Tombstone,
 } from "./types.js"
 
-export { ReviewsError } from "./errors.js"
 
 const REMOVAL_CONFIRMATION_MS = 7 * 24 * 60 * 60 * 1000
 const TASK_RECEIPT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000
@@ -91,7 +90,7 @@ function getIncompleteReason(batch: ReconciliationBatch): string | null {
   return null
 }
 
-function computeAggregates(
+export function computeAggregates(
   reviews: GoogleReview[],
   locationKeys: string[],
 ): { totalReviews: number; averageRating: number; perLocation: Record<string, { count: number; rating: number }> } {

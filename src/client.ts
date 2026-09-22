@@ -16,6 +16,7 @@ import type {
   ReviewsSnapshot,
   RefreshResult,
 } from "./types.js"
+import { isRecord } from "./util.js"
 
 const MAX_POSTBACK_BYTES = 10 * 1024 * 1024
 const CRON_LEASE_MS = 10 * 60 * 1000
@@ -41,9 +42,6 @@ export interface ReviewsClient {
   reportError: ReviewsConfig["hooks"]["reportError"]
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
 
 function timingSafeEqualStrings(a: string, b: string): boolean {
   const bufA = Buffer.from(a)

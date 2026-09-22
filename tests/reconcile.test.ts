@@ -1,11 +1,11 @@
+import { ReviewsError } from "../src/errors.js"
 import { describe, expect, it } from "vitest"
 import {
   createEmptySnapshot,
   getPublicReviews,
   getReviewKey,
   reconcileReviews,
-  ReviewsError,
-} from "../src/reconcile.js"
+  } from "../src/reconcile.js"
 import type {
   GoogleReview,
   ReconciliationBatch,

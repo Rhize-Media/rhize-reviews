@@ -1,8 +1,6 @@
 import type { GoogleReview } from "./types.js"
+import { isRecord } from "./util.js"
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
 
 function parseTimestamp(value: unknown): string | null {
   if (typeof value !== "string") return null

@@ -4,6 +4,7 @@ import { ReviewsError } from "./errors.js"
 import { migrateSnapshot } from "./migrate.js"
 import { createEmptySnapshot, reconcileReviews } from "./reconcile.js"
 import type { ReconciliationBatch, ReconciliationResult, ReviewSyncMode, ReviewsConfig, ReviewsSnapshot } from "./types.js"
+import { isRecord } from "./util.js"
 
 const LEGACY_PATHNAME = "google-reviews/reviews.json"
 const MAX_CAS_ATTEMPTS = 5
@@ -22,9 +23,6 @@ type FreshRead = { snapshot: ReviewsSnapshot; etag: string | null; source: "v3" 
 
 type Auth = { storeId: string; oidcToken: string } | { token: string }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
