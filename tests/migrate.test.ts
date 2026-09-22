@@ -230,4 +230,28 @@ describe("migrateSnapshot", () => {
     const emptyItems = { items: [], totalCount: 0 }
     expect(migrateSnapshot(emptyItems, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
   })
+
+  it("accepts a valid empty NCS legacy snapshot (items: [], totalCount: 0, aggregateRating present)", () => {
+    const raw = { items: [], totalCount: 0, aggregateRating: 0, updatedAt: NOW, title: "Reviews from Google" }
+    const result = migrateSnapshot(raw, { businessName: "Biz", locations: [LOCATIONS[0]!], now: NOW })
+
+    expect(result).not.toBeNull()
+    expect(result?.schemaVersion).toBe(3)
+    expect(result?.reviews).toEqual([])
+    expect(result?.metadata.totalReviews).toBe(0)
+  })
+
+  it("migrates a legacy blob whose first item has id (not reviewId) using that id", () => {
+    const raw = {
+      items: [{ id: "legacy-id-1", profileName: "Grace", reviewText: "Nice work", timestamp: NOW, rating: 5 }],
+      totalCount: 1,
+      aggregateRating: 5,
+      updatedAt: NOW,
+    }
+    const result = migrateSnapshot(raw, { businessName: "Biz", locations: [LOCATIONS[0]!], now: NOW })
+
+    expect(result).not.toBeNull()
+    expect(result?.reviews).toHaveLength(1)
+    expect(result?.reviews[0]).toMatchObject({ id: "legacy-id-1", authorName: "Grace" })
+  })
 })

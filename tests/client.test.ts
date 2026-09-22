@@ -770,6 +770,40 @@ describe("fix round 1: resultAt uses the provider's DataForSEO datetime", () => 
     if (result.status === 422) expect(result.body.error).toBe("result_datetime_invalid")
   })
 
+  it("rejects an impossible calendar date (2026-02-30) instead of letting Date.parse normalize it", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ datetime: "2026-02-30 10:00:00 +00:00" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("result_datetime_invalid")
+  })
+
+  it("accepts Feb 29 on a leap year", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ datetime: "2024-02-29 10:00:00 +00:00" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
+    expect(batchArg.resultAt).toBe(new Date("2024-02-29T10:00:00Z").toISOString())
+  })
+
+  it("rejects a timezone offset hour outside 0-14", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ datetime: "2026-09-21 11:00:34 +99:00" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("result_datetime_invalid")
+  })
+
   it("marks a recovered task with an older DataForSEO datetime than an already-applied newer postback as out_of_order", async () => {
     const storage = liveStorage([SINGLE_LOCATION])
     const client = createReviewsClient(baseConfig(), { storage })

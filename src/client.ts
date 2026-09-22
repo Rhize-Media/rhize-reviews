@@ -73,10 +73,61 @@ function parseDataForSeoDatetime(value: unknown): string | null {
   if (typeof value !== "string") return null
   const match = DATAFORSEO_DATETIME_RE.exec(value.trim())
   if (!match) return null
-  const [, year, month, day, hour, minute, second, tzHour, tzMinute] = match
-  const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${tzHour}:${tzMinute}`
+  const [, yearStr, monthStr, dayStr, hourStr, minuteStr, secondStr, tzHourStr, tzMinuteStr] = match as unknown as [
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+    string,
+  ]
+
+  const year = Number(yearStr)
+  const month = Number(monthStr)
+  const day = Number(dayStr)
+  const hour = Number(hourStr)
+  const minute = Number(minuteStr)
+  const second = Number(secondStr)
+  const tzSign = tzHourStr.startsWith("-") ? -1 : 1
+  const tzHour = Math.abs(Number(tzHourStr))
+  const tzMinute = Number(tzMinuteStr)
+
+  // The regex only validates shape (digit counts), not range — reject
+  // components Date.parse would otherwise silently normalize (e.g. a
+  // nonexistent Feb 30 rolling into March).
+  if (month < 1 || month > 12) return null
+  if (hour > 23) return null
+  if (minute > 59) return null
+  if (second > 59) return null
+  if (tzHour > 14) return null
+  if (tzMinute > 59) return null
+
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate()
+  if (day < 1 || day > daysInMonth) return null
+
+  const iso = `${yearStr}-${monthStr}-${dayStr}T${hourStr}:${minuteStr}:${secondStr}${tzHourStr}:${tzMinuteStr}`
   const ms = Date.parse(iso)
   if (!Number.isFinite(ms)) return null
+
+  // Belt-and-suspenders cross-check: reconstruct the local wall-clock time
+  // from the parsed instant and confirm it matches what was captured, in
+  // case any range above still let a normalized value through.
+  const offsetMs = tzSign * (tzHour * 60 + tzMinute) * 60 * 1000
+  const reconstructed = new Date(ms + offsetMs)
+  if (
+    reconstructed.getUTCFullYear() !== year ||
+    reconstructed.getUTCMonth() + 1 !== month ||
+    reconstructed.getUTCDate() !== day ||
+    reconstructed.getUTCHours() !== hour ||
+    reconstructed.getUTCMinutes() !== minute ||
+    reconstructed.getUTCSeconds() !== second
+  ) {
+    return null
+  }
+
   return new Date(ms).toISOString()
 }
 

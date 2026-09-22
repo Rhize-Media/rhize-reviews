@@ -29,10 +29,18 @@ function isNcsLegacy(raw: unknown): raw is Record<string, unknown> {
   if (!isRecord(raw)) return false
   if ("schemaVersion" in raw) return false
   if (!Array.isArray(raw.items) || typeof raw.totalCount !== "number") return false
-  if (raw.items.length === 0) return false
+
+  if (raw.items.length === 0) {
+    // A valid empty NCS legacy export: no items yet, but NCS legacy always
+    // writes aggregateRating (even when 0) alongside totalCount.
+    return typeof raw.aggregateRating === "number"
+  }
+
   const first = raw.items[0]
   if (!isRecord(first)) return false
-  if (typeof first.reviewId !== "string") return false
+  const hasReviewId = typeof first.reviewId === "string"
+  const hasId = typeof first.id === "string" || typeof first.id === "number"
+  if (!hasReviewId && !hasId) return false
   if (typeof first.rating !== "number" || !Number.isFinite(first.rating)) return false
   return true
 }
