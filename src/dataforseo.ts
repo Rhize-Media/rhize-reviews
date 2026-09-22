@@ -151,7 +151,10 @@ export async function createReviewTasks(
   return { accepted, rejected }
 }
 
-export async function listReadyTasks(cfg: DataForSEOConfig, fetchImpl: typeof fetch = fetch): Promise<string[]> {
+export async function listReadyTasks(
+  cfg: DataForSEOConfig,
+  fetchImpl: typeof fetch = fetch,
+): Promise<Array<{ id: string; tag: string | null }>> {
   const response = await fetchImpl(`${baseUrl(cfg)}/business_data/google/reviews/tasks_ready`, {
     method: "GET",
     headers: { Authorization: authHeader(cfg) },
@@ -161,9 +164,9 @@ export async function listReadyTasks(cfg: DataForSEOConfig, fetchImpl: typeof fe
     await throwForFailedResponse("tasks_ready", response)
   }
 
-  const data = (await response.json()) as { tasks?: Array<{ result?: Array<{ id: string }> }> }
+  const data = (await response.json()) as { tasks?: Array<{ result?: Array<{ id: string; tag?: string | null }> }> }
   const result = data.tasks?.[0]?.result ?? []
-  return result.map(item => item.id)
+  return result.map(item => ({ id: item.id, tag: typeof item.tag === "string" ? item.tag : null }))
 }
 
 export async function getTaskResult(cfg: DataForSEOConfig, taskId: string, fetchImpl: typeof fetch = fetch): Promise<unknown> {

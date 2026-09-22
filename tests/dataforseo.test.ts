@@ -219,15 +219,18 @@ describe("createReviewTasks", () => {
 })
 
 describe("listReadyTasks", () => {
-  it("parses task ids out of the tasks_ready envelope", async () => {
+  it("parses task ids and tags out of the tasks_ready envelope", async () => {
     const fetchImpl = (async () =>
       Response.json({
         status_code: 20000,
-        tasks: [{ result: [{ id: "task-1" }, { id: "task-2" }] }],
+        tasks: [{ result: [{ id: "task-1", tag: "rhize-reviews:vineland:incremental:10" }, { id: "task-2" }] }],
       })) as typeof fetch
 
     const ids = await listReadyTasks(cfg, fetchImpl)
-    expect(ids).toEqual(["task-1", "task-2"])
+    expect(ids).toEqual([
+      { id: "task-1", tag: "rhize-reviews:vineland:incremental:10" },
+      { id: "task-2", tag: null },
+    ])
   })
 
   it("returns an empty array when there is nothing ready", async () => {

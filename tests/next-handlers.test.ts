@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import { createReviewsHandlers } from "../src/next/index.js"
 import { ReviewsError } from "../src/errors.js"
 import type { ReviewsClient } from "../src/client.js"
-import type { ReviewsSnapshot, RefreshResult, PostbackResult } from "../src/types.js"
+import type { ReviewsSnapshot, RefreshResult, PostbackResult, GoogleReview } from "../src/types.js"
 
 type HandlePostbackInput = Parameters<ReviewsClient["handlePostback"]>[0]
 
@@ -18,6 +18,7 @@ function fakeClient(overrides: Partial<ReviewsClient> = {}): ReviewsClient {
     readSnapshot: vi.fn(async () => null),
     getPublicReviews: vi.fn(() => []),
     runRefresh: vi.fn(async () => ({ ok: true, recovered: [], accepted: [], rejected: [], skipped: null }) satisfies RefreshResult),
+    recoverReadyTasks: vi.fn(async () => []),
     handlePostback: vi.fn(async (_input: HandlePostbackInput) => okPostbackResult()),
     assertConfigured: vi.fn(),
     isCronAuthorized: vi.fn(() => true),
@@ -196,6 +197,28 @@ describe("dataforseoWebhookPOST", () => {
     const call = handlePostback.mock.calls[0]![0]
     expect(call.contentLength).toBeUndefined()
   })
+
+  it("returns 400 payload_too_large from Content-Length without ever reading the body", async () => {
+    const handlePostback = vi.fn(async (_input: HandlePostbackInput) => okPostbackResult())
+    const client = fakeClient({ handlePostback })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const arrayBuffer = vi.fn(async () => {
+      throw new Error("body must not be read when Content-Length exceeds the cap")
+    })
+    const oversizedRequest = {
+      url: "https://example.com/api/reviews/webhook",
+      headers: new Headers({ "content-length": String(11 * 1024 * 1024) }),
+      arrayBuffer,
+    } as unknown as Request
+
+    const response = await dataforseoWebhookPOST(oversizedRequest)
+
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(handlePostback).not.toHaveBeenCalled()
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "payload_too_large" })
+  })
 })
 
 describe("dataforseoWebhookGET", () => {
@@ -250,5 +273,62 @@ describe("reviewsApiGET", () => {
     })
     expect(json.meta.perLocation.vineland).not.toHaveProperty("fullLeaseUntil")
     expect(json.meta.perLocation.vineland).not.toHaveProperty("lastAcceptedTaskId")
+  })
+
+  it("projects each review to the public shape, dropping displayable and pendingRemovalAt", async () => {
+    const review: GoogleReview = {
+      id: "r1",
+      locationKey: "vineland",
+      authorName: "Jane",
+      rating: 5,
+      text: "Great!",
+      publishedAt: "2026-09-20T00:00:00.000Z",
+      relativeTime: "a week ago",
+      reviewUrl: "https://example.com/review/r1",
+      profileImageUrl: "https://example.com/avatar.png",
+      ownerReply: { text: "Thanks!", publishedAt: "2026-09-21T00:00:00.000Z" },
+      displayable: true,
+      pendingRemovalAt: null,
+    }
+    const client = fakeClient({ readSnapshot: vi.fn(async () => SNAPSHOT), getPublicReviews: vi.fn(() => [review]) })
+    const { reviewsApiGET } = createReviewsHandlers(client)
+
+    const response = await reviewsApiGET()
+    const json = (await response.json()) as { reviews: Array<Record<string, unknown>> }
+
+    expect(json.reviews).toEqual([
+      {
+        id: "r1",
+        locationKey: "vineland",
+        authorName: "Jane",
+        rating: 5,
+        text: "Great!",
+        publishedAt: "2026-09-20T00:00:00.000Z",
+        relativeTime: "a week ago",
+        reviewUrl: "https://example.com/review/r1",
+        profileImageUrl: "https://example.com/avatar.png",
+        ownerReply: { text: "Thanks!", publishedAt: "2026-09-21T00:00:00.000Z" },
+      },
+    ])
+    expect(json.reviews[0]).not.toHaveProperty("displayable")
+    expect(json.reviews[0]).not.toHaveProperty("pendingRemovalAt")
+  })
+
+  it("uses no-store by default", async () => {
+    const client = fakeClient({ readSnapshot: vi.fn(async () => null), getPublicReviews: vi.fn(() => []) })
+    const { reviewsApiGET } = createReviewsHandlers(client)
+
+    const response = await reviewsApiGET()
+
+    expect(response.headers.get("Cache-Control")).toBe("no-store")
+  })
+
+  it("uses the configured reviewsApiCacheControl override", async () => {
+    const client = fakeClient({ readSnapshot: vi.fn(async () => null), getPublicReviews: vi.fn(() => []) })
+    const { reviewsApiGET } = createReviewsHandlers(client, { reviewsApiCacheControl: "public, max-age=60" })
+
+    const response = await reviewsApiGET()
+
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60")
   })
 })

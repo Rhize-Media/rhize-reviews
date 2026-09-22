@@ -1,14 +1,34 @@
 import { ReviewsError } from "../errors.js"
 import type { ReviewsClient } from "../client.js"
-import type { LocationSyncMetadata, ReviewSyncMode } from "../types.js"
+import type { GoogleReview, LocationSyncMetadata, ReviewSyncMode } from "../types.js"
 
 const GATEWAY_ERROR_CODES = new Set(["dataforseo_billing", "dataforseo_request_failed", "task_rejected"])
+const MAX_POSTBACK_BYTES = 10 * 1024 * 1024
+const DEFAULT_REVIEWS_API_CACHE_CONTROL = "no-store"
 
 interface PublicLocationMeta {
   count: number
   rating: number
   lastSyncMode: ReviewSyncMode | null
   lastResultAt?: string
+}
+
+interface PublicReview {
+  id: string
+  locationKey: string
+  authorName: string
+  rating: 1 | 2 | 3 | 4 | 5
+  text: string
+  publishedAt: string
+  relativeTime?: string
+  reviewUrl?: string
+  profileImageUrl?: string
+  ownerReply?: { text: string; publishedAt?: string }
+}
+
+export interface CreateReviewsHandlersOptions {
+  /** `Cache-Control` header value for `reviewsApiGET`. Default: `"no-store"`. */
+  reviewsApiCacheControl?: string
 }
 
 function toPublicLocationMeta(loc: LocationSyncMetadata): PublicLocationMeta {
@@ -20,12 +40,32 @@ function toPublicLocationMeta(loc: LocationSyncMetadata): PublicLocationMeta {
   }
 }
 
-export function createReviewsHandlers(client: ReviewsClient): {
+/** Strips internal fields (`displayable`, `pendingRemovalAt`) before a review is serialized to the public API. */
+function toPublicReview(review: GoogleReview): PublicReview {
+  return {
+    id: review.id,
+    locationKey: review.locationKey,
+    authorName: review.authorName,
+    rating: review.rating,
+    text: review.text,
+    publishedAt: review.publishedAt,
+    ...(review.relativeTime !== undefined ? { relativeTime: review.relativeTime } : {}),
+    ...(review.reviewUrl !== undefined ? { reviewUrl: review.reviewUrl } : {}),
+    ...(review.profileImageUrl !== undefined ? { profileImageUrl: review.profileImageUrl } : {}),
+    ...(review.ownerReply !== undefined ? { ownerReply: review.ownerReply } : {}),
+  }
+}
+
+export function createReviewsHandlers(
+  client: ReviewsClient,
+  options: CreateReviewsHandlersOptions = {},
+): {
   refreshReviewsGET(request: Request): Promise<Response>
   dataforseoWebhookPOST(request: Request): Promise<Response>
   dataforseoWebhookGET(): Response
   reviewsApiGET(): Promise<Response>
 } {
+  const reviewsApiCacheControl = options.reviewsApiCacheControl ?? DEFAULT_REVIEWS_API_CACHE_CONTROL
   async function refreshReviewsGET(request: Request): Promise<Response> {
     if (!client.isCronAuthorized(request.headers)) {
       return Response.json({ ok: false, error: "unauthorized" }, { status: 401 })
@@ -56,9 +96,14 @@ export function createReviewsHandlers(client: ReviewsClient): {
   }
 
   async function dataforseoWebhookPOST(request: Request): Promise<Response> {
+    const contentLength = Number(request.headers.get("content-length")) || undefined
+
+    if (contentLength !== undefined && contentLength > MAX_POSTBACK_BYTES) {
+      return Response.json({ ok: false, error: "payload_too_large" }, { status: 400 })
+    }
+
     const bytes = new Uint8Array(await request.arrayBuffer())
     const query = new URL(request.url).searchParams
-    const contentLength = Number(request.headers.get("content-length")) || undefined
 
     try {
       const result = await client.handlePostback({
@@ -79,7 +124,7 @@ export function createReviewsHandlers(client: ReviewsClient): {
 
   async function reviewsApiGET(): Promise<Response> {
     const snapshot = await client.readSnapshot()
-    const reviews = client.getPublicReviews(snapshot)
+    const reviews = client.getPublicReviews(snapshot).map(toPublicReview)
 
     const meta = snapshot
       ? {
@@ -93,7 +138,7 @@ export function createReviewsHandlers(client: ReviewsClient): {
         }
       : { stale: false, lastUpdated: null, totalReviews: 0, averageRating: 0, perLocation: {} }
 
-    return Response.json({ reviews, meta }, { status: 200, headers: { "Cache-Control": "no-store" } })
+    return Response.json({ reviews, meta }, { status: 200, headers: { "Cache-Control": reviewsApiCacheControl } })
   }
 
   return { refreshReviewsGET, dataforseoWebhookPOST, dataforseoWebhookGET, reviewsApiGET }

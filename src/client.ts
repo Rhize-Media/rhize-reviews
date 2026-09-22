@@ -36,6 +36,7 @@ export interface ReviewsClient {
   readSnapshot(): Promise<ReviewsSnapshot | null>
   getPublicReviews(snapshot: ReviewsSnapshot | null, opts?: { includeStarOnly?: boolean }): GoogleReview[]
   runRefresh(opts?: { forceFull?: boolean }): Promise<RefreshResult>
+  recoverReadyTasks(): Promise<RefreshResult["recovered"]>
   handlePostback(input: { bytes: Uint8Array; query: URLSearchParams; contentLength?: number }): Promise<PostbackResult>
   assertConfigured(): void
   isCronAuthorized(headers: Headers): boolean
@@ -234,6 +235,11 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       return errorResult(422, "place_id_mismatch")
     }
 
+    const cid = typeof rawResult.cid === "string" ? rawResult.cid : undefined
+    if (cid !== undefined && "cid" in location.identifier && location.identifier.cid !== cid) {
+      return errorResult(422, "cid_mismatch")
+    }
+
     const rawItems = Array.isArray(rawResult.items) ? rawResult.items : []
     const normalized = rawItems.map(item => normalizeReviewItem(item, location.key))
     const reviews = normalized.filter((review): review is GoogleReview => review !== null)
@@ -294,6 +300,48 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     }
   }
 
+  /**
+   * Pulls `tasks_ready` from DataForSEO and feeds each not-yet-processed task
+   * through the same pipeline as a postback, via `task_get`. Tasks whose tag
+   * doesn't parse to one of this client's own configured locations are
+   * skipped without a `task_get` call — `tasks_ready` is a per-DataForSEO-
+   * account queue that can carry another tenant's tasks. Does not touch the
+   * cron lease: `runRefresh` calls this while already holding it, and a
+   * caller invoking it directly runs it unleased.
+   */
+  async function recoverReadyTasks(): Promise<RefreshResult["recovered"]> {
+    const initialFresh = await storage.readFresh()
+    const processedIds = new Set((initialFresh?.snapshot.processedTasks ?? []).map(receipt => receipt.taskId))
+    const ownLocationKeys = new Set(config.locations.map(location => location.key))
+
+    const readyTasks = await listReadyTasks(config.dataforseo, fetchImpl)
+    const recovered: RefreshResult["recovered"] = []
+
+    for (const { id: taskId, tag } of readyTasks) {
+      if (processedIds.has(taskId)) continue
+
+      const parsedTag = tag ? parseTag(tag, legacyLocationKeys) : null
+      if (!parsedTag || !ownLocationKeys.has(parsedTag.locationKey)) continue
+
+      const envelope = await getTaskResult(config.dataforseo, taskId, fetchImpl)
+      const result = await processTaskEnvelope(envelope, "recovery")
+      if (result.status === 200) {
+        recovered.push({ taskId: result.body.taskId, locationKey: result.body.locationKey, decision: result.body.decision })
+      } else {
+        config.hooks.reportError(
+          new ReviewsError("recovery_task_failed", "Recovery task failed the postback pipeline", {
+            taskId,
+            status: result.status,
+            body: result.body,
+          }),
+          { taskId, operation: "recovery" },
+        )
+      }
+    }
+
+    return recovered
+  }
+
   async function handlePostback(input: {
     bytes: Uint8Array
     query: URLSearchParams
@@ -338,29 +386,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     }
 
     try {
-      const initialFresh = await storage.readFresh()
-      const processedIds = new Set((initialFresh?.snapshot.processedTasks ?? []).map(receipt => receipt.taskId))
-
-      const readyIds = await listReadyTasks(config.dataforseo, fetchImpl)
-      const recovered: RefreshResult["recovered"] = []
-
-      for (const taskId of readyIds) {
-        if (processedIds.has(taskId)) continue
-        const envelope = await getTaskResult(config.dataforseo, taskId, fetchImpl)
-        const result = await processTaskEnvelope(envelope, "recovery")
-        if (result.status === 200) {
-          recovered.push({ taskId: result.body.taskId, locationKey: result.body.locationKey, decision: result.body.decision })
-        } else {
-          config.hooks.reportError(
-            new ReviewsError("recovery_task_failed", "Recovery task failed the postback pipeline", {
-              taskId,
-              status: result.status,
-              body: result.body,
-            }),
-            { taskId, operation: "recovery" },
-          )
-        }
-      }
+      const recovered = await recoverReadyTasks()
 
       const freshRead = await storage.readFresh()
       const staleAfterDays = config.sync?.staleAfterDays ?? DEFAULT_STALE_AFTER_DAYS
@@ -439,6 +465,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     readSnapshot,
     getPublicReviews,
     runRefresh,
+    recoverReadyTasks,
     handlePostback,
     assertConfigured,
     isCronAuthorized,

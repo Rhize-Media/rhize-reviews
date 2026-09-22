@@ -105,9 +105,10 @@ function gzipBytesOf(payload: unknown): Uint8Array {
   return new Uint8Array(gzipSync(Buffer.from(JSON.stringify(payload))))
 }
 
-function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag: string; place_id: string; items: unknown[]; rating: number; reviews_count: number; resultCount: number; datetime: string }> = {}) {
+function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag: string; place_id: string; cid: string; items: unknown[]; rating: number; reviews_count: number; resultCount: number; datetime: string }> = {}) {
   const result: Record<string, unknown> = {}
   if (overrides.place_id !== undefined) result.place_id = overrides.place_id
+  if (overrides.cid !== undefined) result.cid = overrides.cid
   result.items = overrides.items ?? [
     { review_id: "r1", timestamp: NOW, rating: { value: 5 }, review_text: "Great!", profile_name: "Jane" },
   ]
@@ -259,6 +260,34 @@ describe("handlePostback: shape and location resolution", () => {
     expect(result.status).toBe(200)
   })
 
+  it("rejects a cid mismatch only when the resolved location is cid-configured", async () => {
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:vineland:incremental:10", cid: "some-other-cid" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("cid_mismatch")
+  })
+
+  it("accepts a matching cid for a cid-configured location", async () => {
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:vineland:incremental:10", cid: "cid-vineland" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+  })
+
+  it("accepts a cid present for a placeId-configured location without comparing it", async () => {
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:berlin:incremental:10", cid: "cid-vineland" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(200)
+  })
+
   it("falls back to the single configured location when no tag is present", async () => {
     const client = createReviewsClient(baseConfig(), { storage: fakeStorage() })
     const result = await client.handlePostback({
@@ -388,6 +417,86 @@ describe("reportError", () => {
   })
 })
 
+describe("recoverReadyTasks", () => {
+  it("processes one ready task and skips one already recorded as processed", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) {
+        return Response.json({
+          tasks: [
+            {
+              result: [
+                { id: "ready-1", tag: "rhize-reviews:vineland:incremental:10" },
+                { id: "already-processed", tag: "rhize-reviews:vineland:incremental:10" },
+              ],
+            },
+          ],
+        })
+      }
+      if (url.includes("task_get")) {
+        return Response.json(taskEnvelope({ id: "ready-1", tag: "rhize-reviews:vineland:incremental:10" }))
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+
+    const snapshot: ReviewsSnapshot = {
+      ...createEmptySnapshot("Biz", [SINGLE_LOCATION], NOW),
+      processedTasks: [{ taskId: "already-processed", locationKey: "vineland", mode: "incremental", resultAt: NOW, processedAt: NOW }],
+    }
+    const storage = fakeStorage()
+    storage.readFresh = vi.fn(async () => ({ snapshot, etag: '"e"', source: "v3" as const }))
+
+    const client = createReviewsClient(baseConfig(), { storage, fetchImpl })
+    const recovered = await client.recoverReadyTasks()
+
+    expect(recovered).toEqual([{ taskId: "ready-1", locationKey: "vineland", decision: "applied" }])
+    expect(fetchImpl).toHaveBeenCalledTimes(2) // tasks_ready + one task_get (not two)
+  })
+
+  it("skips a ready task tagged for another tenant's location without calling task_get", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) {
+        return Response.json({ tasks: [{ result: [{ id: "foreign-1", tag: "rhize-reviews:other:incremental:10" }] }] })
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage, fetchImpl })
+
+    const recovered = await client.recoverReadyTasks()
+
+    expect(recovered).toEqual([])
+    expect(fetchImpl).toHaveBeenCalledTimes(1) // tasks_ready only, no task_get
+  })
+
+  it("skips a ready task with no tag without calling task_get", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "untagged-1" }] }] })
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage, fetchImpl })
+
+    const recovered = await client.recoverReadyTasks()
+
+    expect(recovered).toEqual([])
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not touch the cron lease", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [] }] })
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage, fetchImpl })
+
+    await client.recoverReadyTasks()
+
+    expect(storage.acquireCronLease).not.toHaveBeenCalled()
+    expect(storage.releaseCronLease).not.toHaveBeenCalled()
+  })
+})
+
 describe("runRefresh", () => {
   function refreshDeps() {
     const fetchImpl = vi.fn(async (url: string) => {
@@ -419,7 +528,7 @@ describe("runRefresh", () => {
 
   it("recovers a ready task exactly once through the postback pipeline", async () => {
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "ready-1" }] }] })
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "ready-1", tag: "rhize-reviews:vineland:incremental:10" }] }] })
       if (url.includes("task_get")) return Response.json(taskEnvelope({ id: "ready-1", tag: "rhize-reviews:vineland:incremental:10" }))
       if (url.includes("task_post")) return Response.json({ status_code: 20000, tasks: [] })
       throw new Error(`unexpected fetch ${url}`)
@@ -585,7 +694,7 @@ describe("fix round 1: resultAt uses the provider's DataForSEO datetime", () => 
     if (newer.status === 200) expect(newer.body.decision).toBe("applied")
 
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "task-older" }] }] })
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [{ id: "task-older", tag: "rhize-reviews:vineland:incremental:10" }] }] })
       if (url.includes("task_get")) {
         return Response.json(taskEnvelope({ id: "task-older", datetime: "2026-09-21 11:00:00 +00:00" }))
       }
