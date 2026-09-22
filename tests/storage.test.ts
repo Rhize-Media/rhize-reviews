@@ -148,18 +148,61 @@ describe("createStorage: readFresh", () => {
     await expect(storage.readFresh()).resolves.toBeNull()
   })
 
-  it("serves an unknown schemaVersion as-is and reports it once", async () => {
+  it("throws storage_unsupported_schema for an unknown schemaVersion, never falling back to legacy", async () => {
     const deps = makeDeps()
     const future = { ...createEmptySnapshot("Biz", LOCATIONS, NOW), schemaVersion: 4 }
     deps.get.mockResolvedValueOnce(blobResult(future, '"etag-9"'))
+    const storage = createStorage(baseConfig(), deps)
+
+    await expect(storage.readFresh()).rejects.toMatchObject({ code: "storage_unsupported_schema" })
+    expect(deps.get).toHaveBeenCalledTimes(1) // never reads the legacy pathname
+  })
+})
+
+describe("createStorage: reserved pathname", () => {
+  it("throws storage_invalid_pathname when storage.pathname is the reserved legacy pathname", () => {
+    expect(() => createStorage(baseConfig({ pathname: "google-reviews/reviews.json" }))).toThrow(
+      expect.objectContaining({ code: "storage_invalid_pathname" }),
+    )
+  })
+})
+
+describe("createStorage: unsupported schema fails writes/reads closed", () => {
+  it("writeReconciled fails closed (storage_unavailable) against a v4 blob, and never writes", async () => {
+    const deps = makeDeps()
+    const future = { ...createEmptySnapshot("Biz", LOCATIONS, NOW), schemaVersion: 4 }
+    deps.get.mockResolvedValue(blobResult(future, '"etag-9"'))
+    const storage = createStorage(baseConfig(), deps)
+
+    await expect(storage.writeReconciled(batch("r1"))).rejects.toMatchObject({ code: "storage_unavailable" })
+    expect(deps.put).not.toHaveBeenCalled()
+  })
+
+  it("readForDisplay falls back to a stale copy of the last-known snapshot when one exists", async () => {
+    const deps = makeDeps()
+    const good = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    deps.get.mockResolvedValueOnce(blobResult(good, '"etag-1"'))
+    const cfg = baseConfig()
+    const storage = createStorage(cfg, deps)
+    await storage.readForDisplay()
+
+    const future = { ...good, schemaVersion: 4 }
+    deps.get.mockResolvedValue(blobResult(future, '"etag-9"'))
+    const displayed = await storage.readForDisplay()
+
+    expect(displayed).toMatchObject({ schemaVersion: 3, readState: { stale: true, reason: "storage_unavailable" } })
+    expect(cfg.hooks.reportError).toHaveBeenCalled()
+  })
+
+  it("readForDisplay throws when there is no last-known snapshot to fall back to", async () => {
+    const deps = makeDeps()
+    const future = { ...createEmptySnapshot("Biz", LOCATIONS, NOW), schemaVersion: 4 }
+    deps.get.mockResolvedValue(blobResult(future, '"etag-9"'))
     const cfg = baseConfig()
     const storage = createStorage(cfg, deps)
 
-    const fresh = await storage.readFresh()
-
-    expect(fresh?.snapshot).toMatchObject({ schemaVersion: 4 })
-    expect(fresh?.source).toBe("v3")
-    expect(cfg.hooks.reportError).toHaveBeenCalledTimes(1)
+    await expect(storage.readForDisplay()).rejects.toMatchObject({ code: "storage_unsupported_schema" })
+    expect(cfg.hooks.reportError).toHaveBeenCalled()
   })
 })
 
@@ -221,12 +264,14 @@ describe("createStorage: readForDisplay", () => {
     expect(cfg.hooks.reportError).toHaveBeenCalled()
   })
 
-  it("returns null when there is no last-known snapshot and the read fails", async () => {
+  it("throws (after reporting) when there is no last-known snapshot and the read fails", async () => {
     const deps = makeDeps()
     deps.get.mockRejectedValue(new Error("down"))
-    const storage = createStorage(baseConfig(), deps)
+    const cfg = baseConfig()
+    const storage = createStorage(cfg, deps)
 
-    await expect(storage.readForDisplay()).resolves.toBeNull()
+    await expect(storage.readForDisplay()).rejects.toThrow("down")
+    expect(cfg.hooks.reportError).toHaveBeenCalled()
   })
 
   it("single-flights concurrent calls", async () => {
@@ -472,14 +517,48 @@ describe("createStorage: leases", () => {
     const storage = createStorage(baseConfig(), deps)
 
     const first = await storage.acquireCronLease(new Date(NOW), 10 * 60 * 1000)
-    expect(first).toBe(true)
+    expect(typeof first).toBe("string")
 
     const second = await storage.acquireCronLease(new Date(NOW), 10 * 60 * 1000)
-    expect(second).toBe(false)
+    expect(second).toBeNull()
 
-    await storage.releaseCronLease()
+    await storage.releaseCronLease(first!)
     const third = await storage.acquireCronLease(new Date(NOW), 10 * 60 * 1000)
-    expect(third).toBe(true)
+    expect(typeof third).toBe("string")
+    expect(third).not.toBe(first)
+  })
+
+  it("an expired lease can be taken over by a new owner, and the original owner's release does not clear it", async () => {
+    const deps = makeDeps()
+    let stored = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    let version = 1
+    deps.get.mockImplementation(async () => blobResult(stored, `"etag-${version}"`))
+    deps.put.mockImplementation(async (_p: string, body: string, opts: { ifMatch?: string }) => {
+      if (opts.ifMatch !== `"etag-${version}"`) throw new BlobPreconditionFailedError()
+      stored = JSON.parse(body) as ReviewsSnapshot
+      version += 1
+      return { etag: `"etag-${version}"` }
+    })
+    const storage = createStorage(baseConfig(), deps)
+    const start = new Date(NOW)
+
+    const ownerA = await storage.acquireCronLease(start, 10 * 60 * 1000)
+    expect(ownerA).not.toBeNull()
+
+    const later = new Date(start.getTime() + 11 * 60 * 1000)
+    const ownerB = await storage.acquireCronLease(later, 10 * 60 * 1000)
+    expect(ownerB).not.toBeNull()
+    expect(ownerB).not.toBe(ownerA)
+
+    // A's (stale) release must not clear B's lease.
+    await storage.releaseCronLease(ownerA!)
+    const blockedForA = await storage.acquireCronLease(later, 10 * 60 * 1000)
+    expect(blockedForA).toBeNull()
+
+    // B's own release does clear it.
+    await storage.releaseCronLease(ownerB!)
+    const reacquired = await storage.acquireCronLease(later, 10 * 60 * 1000)
+    expect(reacquired).not.toBeNull()
   })
 
   it("acquires a cron lease again once the previous one has expired", async () => {
@@ -500,7 +579,7 @@ describe("createStorage: leases", () => {
     const later = new Date(start.getTime() + 11 * 60 * 1000)
     const acquiredAfterExpiry = await storage.acquireCronLease(later, 10 * 60 * 1000)
 
-    expect(acquiredAfterExpiry).toBe(true)
+    expect(typeof acquiredAfterExpiry).toBe("string")
   })
 
   it("leaseFull returns only the keys it successfully leased, and skips already-leased keys", async () => {
@@ -560,6 +639,6 @@ describe("createStorage: resetForTests", () => {
     storage.resetForTests()
 
     deps.get.mockRejectedValueOnce(new Error("down"))
-    await expect(storage.readForDisplay()).resolves.toBeNull()
+    await expect(storage.readForDisplay()).rejects.toThrow("down")
   })
 })

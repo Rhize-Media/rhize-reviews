@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { BlobError, BlobPreconditionFailedError, get, put } from "@vercel/blob"
 import { getVercelOidcToken } from "@vercel/oidc"
 import { ReviewsError } from "./errors.js"
@@ -35,6 +36,13 @@ function isConflict(error: unknown): boolean {
 }
 
 export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
+  if (cfg.storage.pathname === LEGACY_PATHNAME) {
+    throw new ReviewsError(
+      "storage_invalid_pathname",
+      `storage.pathname must not be the reserved legacy pathname "${LEGACY_PATHNAME}"`,
+    )
+  }
+
   const getFn = deps.get ?? get
   const putFn = deps.put ?? put
   const getOidcTokenFn = deps.getOidcToken ?? getVercelOidcToken
@@ -62,12 +70,14 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
     return { businessName: cfg.businessName, locations: cfg.locations, now: nowIso() }
   }
 
+  /** Throws `storage_unsupported_schema` for a `schemaVersion` newer than this
+   *  package understands, so a stale reader/writer can never clobber a
+   *  newer-format blob: every caller (reads and CAS writes alike) fails closed. */
   function parseRaw(raw: unknown): ReviewsSnapshot | null {
     if (isRecord(raw) && typeof raw.schemaVersion === "number" && raw.schemaVersion > 3) {
-      cfg.hooks.reportError(new Error("Unknown reviews snapshot schemaVersion"), {
+      throw new ReviewsError("storage_unsupported_schema", `Unsupported reviews snapshot schemaVersion ${raw.schemaVersion}`, {
         schemaVersion: raw.schemaVersion,
       })
-      return raw as unknown as ReviewsSnapshot
     }
     return migrateSnapshot(raw, migrateContext())
   }
@@ -115,8 +125,12 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
         return null
       } catch (error) {
         cfg.hooks.reportError(error, { operation: "readForDisplay" })
-        if (!lastKnownSnapshot) return null
-        return { ...lastKnownSnapshot, readState: { stale: true, reason: "storage_unavailable" } }
+        if (lastKnownSnapshot) {
+          return { ...lastKnownSnapshot, readState: { stale: true, reason: "storage_unavailable" } }
+        }
+        // No fallback available: throw so callers can tell "empty" (no data yet,
+        // returned as null above) apart from "unavailable" (this throw).
+        throw error
       }
     })()
 
@@ -214,28 +228,41 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
     })
   }
 
-  async function acquireCronLease(now: Date, ttlMs: number): Promise<boolean> {
-    let acquired = false
+  /** Acquires the cron lease and returns a fresh owner id (or `null` if already
+   *  held by someone else, unexpired). The caller must pass that id back to
+   *  `releaseCronLease` — this prevents a slow/late release from an earlier
+   *  holder clearing a lease a new holder has since acquired. */
+  async function acquireCronLease(now: Date, ttlMs: number): Promise<string | null> {
+    let owner: string | null = null
     await updateMetadata(snapshot => {
       const until = snapshot.metadata.cronLeaseUntil
       if (until && Date.parse(until) > now.getTime()) {
-        acquired = false
+        owner = null
         return null
       }
-      acquired = true
+      owner = randomUUID()
       return {
         ...snapshot,
-        metadata: { ...snapshot.metadata, cronLeaseUntil: new Date(now.getTime() + ttlMs).toISOString() },
+        metadata: {
+          ...snapshot.metadata,
+          cronLeaseUntil: new Date(now.getTime() + ttlMs).toISOString(),
+          cronLeaseOwner: owner,
+        },
       }
     })
-    return acquired
+    return owner
   }
 
-  async function releaseCronLease(): Promise<void> {
-    await updateMetadata(snapshot => ({
-      ...snapshot,
-      metadata: { ...snapshot.metadata, cronLeaseUntil: null },
-    }))
+  /** Clears the cron lease only when it is still held by `owner` — a release
+   *  from a lease's previous (expired, taken-over) holder is a no-op. */
+  async function releaseCronLease(owner: string): Promise<void> {
+    await updateMetadata(snapshot => {
+      if (snapshot.metadata.cronLeaseOwner !== owner) return null
+      return {
+        ...snapshot,
+        metadata: { ...snapshot.metadata, cronLeaseUntil: null, cronLeaseOwner: null },
+      }
+    })
   }
 
   async function leaseFull(locationKeys: string[], now: Date, ttlMs: number): Promise<string[]> {

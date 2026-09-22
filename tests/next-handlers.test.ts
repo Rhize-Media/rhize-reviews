@@ -22,6 +22,7 @@ function fakeClient(overrides: Partial<ReviewsClient> = {}): ReviewsClient {
     handlePostback: vi.fn(async (_input: HandlePostbackInput) => okPostbackResult()),
     assertConfigured: vi.fn(),
     isCronAuthorized: vi.fn(() => true),
+    isWebhookAuthorized: vi.fn(() => true),
     reportError: vi.fn(),
     ...overrides,
   }
@@ -219,6 +220,98 @@ describe("dataforseoWebhookPOST", () => {
     expect(response.status).toBe(400)
     await expect(response.json()).resolves.toEqual({ ok: false, error: "payload_too_large" })
   })
+
+  it("returns 401 without ever touching the body when isWebhookAuthorized is false", async () => {
+    const handlePostback = vi.fn(async (_input: HandlePostbackInput) => okPostbackResult())
+    const client = fakeClient({ handlePostback, isWebhookAuthorized: vi.fn(() => false) })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const bodyGetter = vi.fn()
+    const arrayBuffer = vi.fn(async () => {
+      throw new Error("body must not be read when unauthorized")
+    })
+    const unauthorizedRequest = {
+      url: "https://example.com/api/reviews/webhook?secret=wrong",
+      headers: new Headers(),
+      get body() {
+        bodyGetter()
+        throw new Error("body must not be touched when unauthorized")
+      },
+      arrayBuffer,
+    } as unknown as Request
+
+    const response = await dataforseoWebhookPOST(unauthorizedRequest)
+
+    expect(response.status).toBe(401)
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "unauthorized" })
+    expect(bodyGetter).not.toHaveBeenCalled()
+    expect(arrayBuffer).not.toHaveBeenCalled()
+    expect(handlePostback).not.toHaveBeenCalled()
+  })
+
+  it("rejects a non-integer Content-Length with 400", async () => {
+    const client = fakeClient({ isWebhookAuthorized: vi.fn(() => true) })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const request = {
+      url: "https://example.com/api/reviews/webhook",
+      headers: new Headers({ "content-length": "not-a-number" }),
+      body: undefined,
+      arrayBuffer: vi.fn(),
+    } as unknown as Request
+
+    const response = await dataforseoWebhookPOST(request)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "invalid_content_length" })
+  })
+
+  it("rejects a negative Content-Length with 400", async () => {
+    const client = fakeClient({ isWebhookAuthorized: vi.fn(() => true) })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const request = {
+      url: "https://example.com/api/reviews/webhook",
+      headers: new Headers({ "content-length": "-5" }),
+      body: undefined,
+      arrayBuffer: vi.fn(),
+    } as unknown as Request
+
+    const response = await dataforseoWebhookPOST(request)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "invalid_content_length" })
+  })
+
+  it("aborts a chunked body over the cap with 400 before the stream completes", async () => {
+    const handlePostback = vi.fn(async (_input: HandlePostbackInput) => okPostbackResult())
+    const client = fakeClient({ handlePostback, isWebhookAuthorized: vi.fn(() => true) })
+    const { dataforseoWebhookPOST } = createReviewsHandlers(client)
+
+    const chunk = new Uint8Array(4 * 1024 * 1024) // 4 MiB; 3 chunks = 12 MiB > the 10 MiB cap
+    let pulls = 0
+    const reader = {
+      read: vi.fn(async () => {
+        pulls += 1
+        if (pulls > 3) throw new Error("must not pull a 4th chunk once the running total exceeds the cap")
+        return { done: false, value: chunk }
+      }),
+      cancel: vi.fn(async () => {}),
+    }
+    const streamingRequest = {
+      url: "https://example.com/api/reviews/webhook",
+      headers: new Headers(),
+      body: { getReader: () => reader },
+    } as unknown as Request
+
+    const response = await dataforseoWebhookPOST(streamingRequest)
+
+    expect(response.status).toBe(400)
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "payload_too_large" })
+    expect(reader.cancel).toHaveBeenCalled()
+    expect(handlePostback).not.toHaveBeenCalled()
+    expect(pulls).toBeLessThanOrEqual(3)
+  })
 })
 
 describe("dataforseoWebhookGET", () => {
@@ -243,6 +336,22 @@ describe("dataforseoWebhookGET", () => {
 })
 
 describe("reviewsApiGET", () => {
+  it("returns 503 storage_unavailable with no-store when readSnapshot throws", async () => {
+    const thrown = new Error("blob down")
+    const client = fakeClient({
+      readSnapshot: vi.fn(async () => {
+        throw thrown
+      }),
+    })
+    const { reviewsApiGET } = createReviewsHandlers(client)
+
+    const response = await reviewsApiGET()
+
+    expect(response.status).toBe(503)
+    expect(response.headers.get("Cache-Control")).toBe("no-store")
+    await expect(response.json()).resolves.toEqual({ ok: false, error: "storage_unavailable" })
+  })
+
   it("returns empty defaults with no-store when there is no snapshot", async () => {
     const client = fakeClient({ readSnapshot: vi.fn(async () => null), getPublicReviews: vi.fn(() => []) })
     const { reviewsApiGET } = createReviewsHandlers(client)

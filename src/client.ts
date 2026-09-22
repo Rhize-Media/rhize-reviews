@@ -40,6 +40,7 @@ export interface ReviewsClient {
   handlePostback(input: { bytes: Uint8Array; query: URLSearchParams; contentLength?: number }): Promise<PostbackResult>
   assertConfigured(): void
   isCronAuthorized(headers: Headers): boolean
+  isWebhookAuthorized(query: URLSearchParams): boolean
   reportError: ReviewsConfig["hooks"]["reportError"]
 }
 
@@ -59,15 +60,22 @@ function storageUnavailableResult(): PostbackResult {
   return { status: 503, body: { ok: false, error: "storage_unavailable" } }
 }
 
+const DATAFORSEO_DATETIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}) ([+-]\d{2}):(\d{2})$/
+
 /**
- * Parses a DataForSEO `result[0].datetime` value, e.g. `"2026-09-21 11:00:34 +00:00"`,
- * into an ISO-8601 instant. Returns `null` when absent or unparseable so callers can
- * fall back to `now()`.
+ * Strictly parses a DataForSEO `result[0].datetime` value in its documented
+ * shape, `"YYYY-MM-DD HH:MM:SS ±HH:MM"` (e.g. `"2026-09-21 11:00:34 +00:00"`),
+ * into an ISO-8601 instant. Returns `null` for anything else — including a
+ * value with no timezone offset — so the caller treats it as invalid rather
+ * than silently substituting wall-clock time.
  */
 function parseDataForSeoDatetime(value: unknown): string | null {
-  if (typeof value !== "string" || value.trim().length === 0) return null
-  const isoish = value.trim().replace(" ", "T").replace(/\s+(?=[+-]\d{2}:\d{2}$)/, "")
-  const ms = Date.parse(isoish)
+  if (typeof value !== "string") return null
+  const match = DATAFORSEO_DATETIME_RE.exec(value.trim())
+  if (!match) return null
+  const [, year, month, day, hour, minute, second, tzHour, tzMinute] = match
+  const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}${tzHour}:${tzMinute}`
+  const ms = Date.parse(iso)
   if (!Number.isFinite(ms)) return null
   return new Date(ms).toISOString()
 }
@@ -88,10 +96,6 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
 
   function nowDate(): Date {
     return config.now?.() ?? new Date()
-  }
-
-  function nowIso(): string {
-    return nowDate().toISOString()
   }
 
   function assertConfigured(): void {
@@ -127,6 +131,22 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     return timingSafeEqualStrings(authorization, `Bearer ${config.cron.secret}`)
   }
 
+  /** The constant-time `?secret=` check shared by `isWebhookAuthorized` (so a
+   *  caller can authenticate before reading the request body) and
+   *  `handlePostback` (which always re-checks it itself). */
+  function checkWebhookSecret(query: URLSearchParams): boolean {
+    const suppliedSecrets = query.getAll("secret")
+    return (
+      Boolean(config.webhook.secret) &&
+      suppliedSecrets.length === 1 &&
+      timingSafeEqualStrings(suppliedSecrets[0]!, config.webhook.secret)
+    )
+  }
+
+  function isWebhookAuthorized(query: URLSearchParams): boolean {
+    return checkWebhookSecret(query)
+  }
+
   async function readSnapshot(): Promise<ReviewsSnapshot | null> {
     return storage.readForDisplay()
   }
@@ -154,7 +174,13 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     let resolved: { locationKey: string; mode: ReviewSyncMode; depth: number } | null = null
 
     if (dataTag !== null && queryTag !== null) {
-      if (!parsedFromData || !parsedFromQuery || parsedFromData.locationKey !== parsedFromQuery.locationKey) {
+      if (
+        !parsedFromData ||
+        !parsedFromQuery ||
+        parsedFromData.locationKey !== parsedFromQuery.locationKey ||
+        parsedFromData.mode !== parsedFromQuery.mode ||
+        parsedFromData.depth !== parsedFromQuery.depth
+      ) {
         return { error: "tag_conflict" }
       }
       resolved = parsedFromQuery
@@ -231,13 +257,24 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     const { location, mode, depth } = resolution
 
     const placeId = typeof rawResult.place_id === "string" ? rawResult.place_id : undefined
-    if (placeId !== undefined && "placeId" in location.identifier && location.identifier.placeId !== placeId) {
-      return errorResult(422, "place_id_mismatch")
+    if ("placeId" in location.identifier) {
+      if (placeId === undefined) return errorResult(422, "place_id_missing")
+      if (location.identifier.placeId !== placeId) return errorResult(422, "place_id_mismatch")
     }
 
     const cid = typeof rawResult.cid === "string" ? rawResult.cid : undefined
-    if (cid !== undefined && "cid" in location.identifier && location.identifier.cid !== cid) {
-      return errorResult(422, "cid_mismatch")
+    if ("cid" in location.identifier) {
+      if (cid === undefined) return errorResult(422, "cid_missing")
+      if (location.identifier.cid !== cid) return errorResult(422, "cid_mismatch")
+    }
+
+    const resultAt = parseDataForSeoDatetime(rawResult.datetime)
+    if (resultAt === null) {
+      config.hooks.reportError(
+        new ReviewsError("result_datetime_invalid", "DataForSEO result.datetime is missing or not in the expected format"),
+        { taskId: rawTask.id, source, datetime: rawResult.datetime },
+      )
+      return errorResult(422, "result_datetime_invalid")
     }
 
     const rawItems = Array.isArray(rawResult.items) ? rawResult.items : []
@@ -246,7 +283,6 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     const invalidItemsCount = rawItems.length - reviews.length
 
     const listingSummary = parseListingSummary(rawResult)
-    const resultAt = parseDataForSeoDatetime(rawResult.datetime) ?? nowIso()
 
     const batch: ReconciliationBatch = {
       taskId: rawTask.id,
@@ -347,12 +383,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     query: URLSearchParams
     contentLength?: number
   }): Promise<PostbackResult> {
-    const suppliedSecrets = input.query.getAll("secret")
-    if (
-      !config.webhook.secret ||
-      suppliedSecrets.length !== 1 ||
-      !timingSafeEqualStrings(suppliedSecrets[0]!, config.webhook.secret)
-    ) {
+    if (!checkWebhookSecret(input.query)) {
       return errorResult(401, "unauthorized")
     }
 
@@ -380,8 +411,8 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     assertConfigured()
 
     const now = nowDate()
-    const acquired = await storage.acquireCronLease(now, CRON_LEASE_MS)
-    if (!acquired) {
+    const leaseOwner = await storage.acquireCronLease(now, CRON_LEASE_MS)
+    if (!leaseOwner) {
       return { ok: true, recovered: [], accepted: [], rejected: [], skipped: "cron_lease_held" }
     }
 
@@ -457,7 +488,14 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
 
       return { ok: true, recovered, accepted, rejected, skipped: null }
     } finally {
-      await storage.releaseCronLease()
+      // Best-effort: a release failure must never mask the run's own result or
+      // error (e.g. a thrown billing/transport error above). The lease still
+      // expires on its own via its TTL.
+      try {
+        await storage.releaseCronLease(leaseOwner)
+      } catch (error) {
+        config.hooks.reportError(error, { operation: "releaseCronLease" })
+      }
     }
   }
 
@@ -469,6 +507,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     handlePostback,
     assertConfigured,
     isCronAuthorized,
+    isWebhookAuthorized,
     reportError: config.hooks.reportError,
   }
 }

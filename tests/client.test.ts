@@ -49,8 +49,8 @@ function baseStorage(snapshot: ReviewsSnapshot | null = null): FakeStorage {
     readForDisplay: vi.fn(async () => current),
     writeReconciled: vi.fn(async (batch: ReconciliationBatch) => reconcileStub(batch)),
     updateMetadata: vi.fn(async () => true),
-    acquireCronLease: vi.fn(async () => true),
-    releaseCronLease: vi.fn(async () => {}),
+    acquireCronLease: vi.fn(async () => "lease-owner-stub"),
+    releaseCronLease: vi.fn(async (_owner: string) => {}),
     leaseFull: vi.fn(async (keys: string[]) => keys),
     clearFullLease: vi.fn(async () => {}),
     recordPendingTasks: vi.fn(async () => {}),
@@ -73,8 +73,8 @@ function liveStorage(locations: ReviewLocation[]): FakeStorage {
       return { result, written: result.decision === "applied" }
     }),
     updateMetadata: vi.fn(async () => true),
-    acquireCronLease: vi.fn(async () => true),
-    releaseCronLease: vi.fn(async () => {}),
+    acquireCronLease: vi.fn(async () => "lease-owner-stub"),
+    releaseCronLease: vi.fn(async (_owner: string) => {}),
     leaseFull: vi.fn(async (keys: string[]) => keys),
     clearFullLease: vi.fn(async () => {}),
     recordPendingTasks: vi.fn(async () => {}),
@@ -105,16 +105,41 @@ function gzipBytesOf(payload: unknown): Uint8Array {
   return new Uint8Array(gzipSync(Buffer.from(JSON.stringify(payload))))
 }
 
-function taskEnvelope(overrides: Partial<{ id: string; status_code: number; tag: string; place_id: string; cid: string; items: unknown[]; rating: number; reviews_count: number; resultCount: number; datetime: string }> = {}) {
+// `cid` and `datetime` default to values that satisfy the default target
+// (SINGLE_LOCATION "vineland", cid-configured) so tests not specifically
+// about identity/datetime validation don't need to know about either.
+// Pass `null` explicitly to omit the field (to test the "missing" case).
+function taskEnvelope(
+  overrides: Partial<{
+    id: string
+    status_code: number
+    tag: string
+    place_id: string
+    cid: string | null
+    items: unknown[]
+    rating: number
+    reviews_count: number
+    resultCount: number
+    datetime: string | null
+  }> = {},
+) {
   const result: Record<string, unknown> = {}
   if (overrides.place_id !== undefined) result.place_id = overrides.place_id
-  if (overrides.cid !== undefined) result.cid = overrides.cid
+  if (overrides.cid !== undefined) {
+    if (overrides.cid !== null) result.cid = overrides.cid
+  } else {
+    result.cid = "cid-vineland"
+  }
   result.items = overrides.items ?? [
     { review_id: "r1", timestamp: NOW, rating: { value: 5 }, review_text: "Great!", profile_name: "Jane" },
   ]
   if (overrides.rating !== undefined) result.rating = { value: overrides.rating }
   if (overrides.reviews_count !== undefined) result.reviews_count = overrides.reviews_count
-  if (overrides.datetime !== undefined) result.datetime = overrides.datetime
+  if (overrides.datetime !== undefined) {
+    if (overrides.datetime !== null) result.datetime = overrides.datetime
+  } else {
+    result.datetime = "2026-09-21 00:00:00 +00:00" // matches NOW
+  }
 
   return {
     status_code: 20000,
@@ -282,10 +307,40 @@ describe("handlePostback: shape and location resolution", () => {
   it("accepts a cid present for a placeId-configured location without comparing it", async () => {
     const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
     const result = await client.handlePostback({
-      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:berlin:incremental:10", cid: "cid-vineland" })),
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:berlin:incremental:10", place_id: "place-berlin", cid: "cid-vineland" })),
       query: new URLSearchParams({ secret: "s3cret" }),
     })
     expect(result.status).toBe(200)
+  })
+
+  it("rejects a placeId-configured location with a missing place_id with 422 place_id_missing", async () => {
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:berlin:incremental:10" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("place_id_missing")
+  })
+
+  it("rejects a cid-configured location with a missing cid with 422 cid_missing", async () => {
+    const client = createReviewsClient(baseConfig({}, [SINGLE_LOCATION, PLACE_ID_LOCATION]), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:vineland:incremental:10", cid: null })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("cid_missing")
+  })
+
+  it("rejects ?tag and data.tag that agree on locationKey but disagree on depth with 422 tag_conflict", async () => {
+    const client = createReviewsClient(baseConfig(), { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:vineland:incremental:10" })),
+      query: new URLSearchParams({ secret: "s3cret", tag: "rhize-reviews:vineland:incremental:20" }),
+    })
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("tag_conflict")
   })
 
   it("falls back to the single configured location when no tag is present", async () => {
@@ -518,8 +573,40 @@ describe("runRefresh", () => {
     await expect(client.runRefresh()).rejects.toMatchObject({ code: "not_configured" })
   })
 
+  it("a releaseCronLease failure is swallowed (reported, not thrown) and never masks the run's own result", async () => {
+    const storage = fakeStorage({
+      releaseCronLease: vi.fn(async () => {
+        throw new Error("release boom")
+      }),
+    })
+    const cfg = baseConfig()
+    const client = createReviewsClient(cfg, { storage, fetchImpl: refreshDeps() })
+
+    const result = await client.runRefresh()
+
+    expect(result.ok).toBe(true)
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(expect.any(Error), { operation: "releaseCronLease" })
+  })
+
+  it("a releaseCronLease failure is swallowed and never masks a thrown error from the run itself", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [] }] })
+      if (url.includes("task_post")) return new Response("server error", { status: 500 })
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const storage = fakeStorage({
+      releaseCronLease: vi.fn(async () => {
+        throw new Error("release boom")
+      }),
+    })
+    const client = createReviewsClient(baseConfig(), { storage, fetchImpl })
+
+    // The task_post transport failure must propagate — not the releaseCronLease failure.
+    await expect(client.runRefresh()).rejects.toMatchObject({ code: "dataforseo_request_failed" })
+  })
+
   it("returns skipped: cron_lease_held when the lease is already held", async () => {
-    const storage = fakeStorage({ acquireCronLease: vi.fn(async () => false) })
+    const storage = fakeStorage({ acquireCronLease: vi.fn(async () => null) })
     const client = createReviewsClient(baseConfig(), { storage, fetchImpl: refreshDeps() })
     const result = await client.runRefresh()
     expect(result.skipped).toBe("cron_lease_held")
@@ -658,28 +745,29 @@ describe("fix round 1: resultAt uses the provider's DataForSEO datetime", () => 
     expect(batchArg.resultAt).toBe(new Date("2026-09-21T11:00:34+00:00").toISOString())
   })
 
-  it("falls back to now() when result.datetime is absent", async () => {
+  it("rejects with 422 result_datetime_invalid, and reports it, when result.datetime is absent", async () => {
     const storage = fakeStorage()
-    const client = createReviewsClient(baseConfig(), { storage })
+    const cfg = baseConfig()
+    const client = createReviewsClient(cfg, { storage })
     const result = await client.handlePostback({
-      bytes: bytesOf(taskEnvelope()),
+      bytes: bytesOf(taskEnvelope({ datetime: null })),
       query: new URLSearchParams({ secret: "s3cret" }),
     })
-    expect(result.status).toBe(200)
-    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
-    expect(batchArg.resultAt).toBe(NOW)
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("result_datetime_invalid")
+    expect(cfg.hooks.reportError).toHaveBeenCalled()
+    expect(storage.writeReconciled).not.toHaveBeenCalled()
   })
 
-  it("falls back to now() when result.datetime is unparseable", async () => {
+  it("rejects with 422 result_datetime_invalid for a timezone-free datetime value", async () => {
     const storage = fakeStorage()
     const client = createReviewsClient(baseConfig(), { storage })
     const result = await client.handlePostback({
-      bytes: bytesOf(taskEnvelope({ datetime: "not-a-datetime" })),
+      bytes: bytesOf(taskEnvelope({ datetime: "2026-09-21 11:00:34" })),
       query: new URLSearchParams({ secret: "s3cret" }),
     })
-    expect(result.status).toBe(200)
-    const batchArg = vi.mocked(storage.writeReconciled).mock.calls[0]![0] as ReconciliationBatch
-    expect(batchArg.resultAt).toBe(NOW)
+    expect(result.status).toBe(422)
+    if (result.status === 422) expect(result.body.error).toBe("result_datetime_invalid")
   })
 
   it("marks a recovered task with an older DataForSEO datetime than an already-applied newer postback as out_of_order", async () => {

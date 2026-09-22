@@ -68,6 +68,7 @@ export interface ReviewsSnapshot {
     perLocation: Record<string, LocationSyncMetadata>
     lastSuccessfulWriteAt?: string
     cronLeaseUntil?: string | null
+    cronLeaseOwner?: string | null
     pendingTasks: Array<{ taskId: string; locationKey: string; mode: ReviewSyncMode; depth: number; createdAt: string }>
   }
   processedTasks: TaskReceipt[]

@@ -6,6 +6,45 @@ const GATEWAY_ERROR_CODES = new Set(["dataforseo_billing", "dataforseo_request_f
 const MAX_POSTBACK_BYTES = 10 * 1024 * 1024
 const DEFAULT_REVIEWS_API_CACHE_CONTROL = "no-store"
 
+class PayloadTooLargeError extends Error {}
+
+/**
+ * Reads a request body via its stream, aborting as soon as the running total
+ * exceeds `maxBytes` — never buffering more than that, and never relying on
+ * `Content-Length` alone (a header-less or lying request is still capped).
+ */
+async function readBodyCapped(request: Request, maxBytes: number): Promise<Uint8Array> {
+  const reader = request.body?.getReader()
+  if (!reader) {
+    const buf = new Uint8Array(await request.arrayBuffer())
+    if (buf.byteLength > maxBytes) throw new PayloadTooLargeError()
+    return buf
+  }
+
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) {
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {})
+        throw new PayloadTooLargeError()
+      }
+      chunks.push(value)
+    }
+  }
+
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return out
+}
+
 interface PublicLocationMeta {
   count: number
   rating: number
@@ -96,14 +135,37 @@ export function createReviewsHandlers(
   }
 
   async function dataforseoWebhookPOST(request: Request): Promise<Response> {
-    const contentLength = Number(request.headers.get("content-length")) || undefined
+    const query = new URL(request.url).searchParams
 
-    if (contentLength !== undefined && contentLength > MAX_POSTBACK_BYTES) {
-      return Response.json({ ok: false, error: "payload_too_large" }, { status: 400 })
+    // Authenticate before touching the body at all: an unauthorized caller
+    // never causes us to read (or buffer) anything they sent.
+    if (!client.isWebhookAuthorized(query)) {
+      return Response.json({ ok: false, error: "unauthorized" }, { status: 401 })
     }
 
-    const bytes = new Uint8Array(await request.arrayBuffer())
-    const query = new URL(request.url).searchParams
+    const contentLengthHeader = request.headers.get("content-length")
+    let contentLength: number | undefined
+    if (contentLengthHeader !== null) {
+      const parsed = Number(contentLengthHeader)
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        return Response.json({ ok: false, error: "invalid_content_length" }, { status: 400 })
+      }
+      contentLength = parsed
+      if (contentLength > MAX_POSTBACK_BYTES) {
+        return Response.json({ ok: false, error: "payload_too_large" }, { status: 400 })
+      }
+    }
+
+    let bytes: Uint8Array
+    try {
+      bytes = await readBodyCapped(request, MAX_POSTBACK_BYTES)
+    } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        return Response.json({ ok: false, error: "payload_too_large" }, { status: 400 })
+      }
+      client.reportError(error, { handler: "dataforseoWebhookPOST" })
+      return Response.json({ ok: false, error: "internal_error" }, { status: 500 })
+    }
 
     try {
       const result = await client.handlePostback({
@@ -123,7 +185,16 @@ export function createReviewsHandlers(
   }
 
   async function reviewsApiGET(): Promise<Response> {
-    const snapshot = await client.readSnapshot()
+    let snapshot: Awaited<ReturnType<ReviewsClient["readSnapshot"]>>
+    try {
+      snapshot = await client.readSnapshot()
+    } catch {
+      // storage.readForDisplay already reported this failure before throwing.
+      return Response.json(
+        { ok: false, error: "storage_unavailable" },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      )
+    }
     const reviews = client.getPublicReviews(snapshot).map(toPublicReview)
 
     const meta = snapshot
