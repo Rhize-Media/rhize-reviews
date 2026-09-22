@@ -27,7 +27,14 @@ function isSjgV2(raw: unknown): raw is Record<string, unknown> {
 
 function isNcsLegacy(raw: unknown): raw is Record<string, unknown> {
   if (!isRecord(raw)) return false
-  return Array.isArray(raw.items) && typeof raw.totalCount === "number"
+  if ("schemaVersion" in raw) return false
+  if (!Array.isArray(raw.items) || typeof raw.totalCount !== "number") return false
+  if (raw.items.length === 0) return false
+  const first = raw.items[0]
+  if (!isRecord(first)) return false
+  if (typeof first.reviewId !== "string") return false
+  if (typeof first.rating !== "number" || !Number.isFinite(first.rating)) return false
+  return true
 }
 
 function toRating(value: unknown): 1 | 2 | 3 | 4 | 5 {
@@ -35,6 +42,22 @@ function toRating(value: unknown): 1 | 2 | 3 | 4 | 5 {
   if (n <= 1) return 1
   if (n >= 5) return 5
   return n as 1 | 2 | 3 | 4 | 5
+}
+
+/** Finds the legacy `metadata.locations[Name]` watermark entry (keyed by the
+ *  original SJG display name) whose mapped key equals `key`, so it can be
+ *  carried into the migrated `perLocation[key]`. */
+function findLegacyLocationMeta(
+  locationsRaw: Record<string, unknown> | undefined,
+  key: string,
+  legacyLocationKeys: Record<string, string>,
+): Record<string, unknown> | undefined {
+  if (!locationsRaw) return undefined
+  for (const [name, value] of Object.entries(locationsRaw)) {
+    const mappedKey = legacyLocationKeys[name] ?? name
+    if (mappedKey === key && isRecord(value)) return value
+  }
+  return undefined
 }
 
 function migrateSjgV2(raw: Record<string, unknown>, ctx: MigrateContext): ReviewsSnapshot {
@@ -86,10 +109,27 @@ function migrateSjgV2(raw: Record<string, unknown>, ctx: MigrateContext): Review
 
   const locationKeys = ctx.locations.map(l => l.key)
   const aggregates = computeAggregates(reviews, locationKeys)
+  const locationsRaw = isRecord(metadata.locations) ? metadata.locations : undefined
   const perLocation: Record<string, LocationSyncMetadata> = {}
   for (const key of locationKeys) {
     const computed = aggregates.perLocation[key]!
-    perLocation[key] = { count: computed.count, rating: computed.rating, lastSyncMode: null }
+    const legacyMeta = findLegacyLocationMeta(locationsRaw, key, legacyLocationKeys)
+    perLocation[key] = {
+      count: computed.count,
+      rating: computed.rating,
+      lastSyncMode: null,
+      ...(legacyMeta && typeof legacyMeta.lastResultAt === "string" ? { lastResultAt: legacyMeta.lastResultAt } : {}),
+      ...(legacyMeta && typeof legacyMeta.lastIncrementalAt === "string" ? { lastIncrementalAt: legacyMeta.lastIncrementalAt } : {}),
+      ...(legacyMeta && typeof legacyMeta.lastFullAttemptAt === "string" ? { lastFullAttemptAt: legacyMeta.lastFullAttemptAt } : {}),
+      ...(legacyMeta && typeof legacyMeta.lastFullReconciledAt === "string"
+        ? { lastFullReconciledAt: legacyMeta.lastFullReconciledAt }
+        : {}),
+      ...(legacyMeta && typeof legacyMeta.requestedDepth === "number" ? { requestedDepth: legacyMeta.requestedDepth } : {}),
+      ...(legacyMeta && typeof legacyMeta.itemsCount === "number" ? { itemsCount: legacyMeta.itemsCount } : {}),
+      ...(legacyMeta && typeof legacyMeta.reviewsCount === "number" ? { reviewsCount: legacyMeta.reviewsCount } : {}),
+      ...(legacyMeta && typeof legacyMeta.incompleteReason === "string" ? { incompleteReason: legacyMeta.incompleteReason } : {}),
+      ...(legacyMeta && typeof legacyMeta.lastAcceptedTaskId === "string" ? { lastAcceptedTaskId: legacyMeta.lastAcceptedTaskId } : {}),
+    }
   }
 
   const lastUpdated = typeof raw.lastUpdated === "string" ? raw.lastUpdated : ctx.now
@@ -119,9 +159,10 @@ function migrateNcsLegacy(raw: Record<string, unknown>, ctx: MigrateContext): Re
   const reviews: GoogleReview[] = items.map((item, index) => {
     const text = typeof item.reviewText === "string" ? item.reviewText : ""
     const ownerAnswer = typeof item.ownerAnswer === "string" ? item.ownerAnswer : undefined
+    const reviewId = typeof item.reviewId === "string" ? item.reviewId : item.id !== undefined ? String(item.id) : undefined
 
     const migrated: GoogleReview = {
-      id: item.id !== undefined ? String(item.id) : String(index),
+      id: reviewId ?? String(index),
       locationKey,
       authorName: typeof item.profileName === "string" ? item.profileName : "",
       rating: toRating(item.rating),
@@ -133,7 +174,10 @@ function migrateNcsLegacy(raw: Record<string, unknown>, ctx: MigrateContext): Re
     if (typeof item.timeAgo === "string") migrated.relativeTime = item.timeAgo
     if (typeof item.reviewUrl === "string") migrated.reviewUrl = item.reviewUrl
     if (typeof item.profileImageUrl === "string") migrated.profileImageUrl = item.profileImageUrl
-    if (ownerAnswer) migrated.ownerReply = { text: ownerAnswer }
+    if (ownerAnswer) {
+      migrated.ownerReply =
+        typeof item.ownerTimestamp === "string" ? { text: ownerAnswer, publishedAt: item.ownerTimestamp } : { text: ownerAnswer }
+    }
     return migrated
   })
 

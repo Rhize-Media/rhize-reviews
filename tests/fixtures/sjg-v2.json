@@ -48,7 +48,17 @@
     "locationBreakdown": { "Vineland": 1, "Berlin": 1, "Glassboro": 0, "Marmora": 0, "Wildwood": 0 },
     "lastSuccessfulWriteAt": "2026-08-20T00:00:00.000Z",
     "locations": {
-      "Vineland": { "lastAcceptedTaskId": "legacy-task-1", "lastResultAt": "2026-08-15T10:00:00.000Z" },
+      "Vineland": {
+        "lastAcceptedTaskId": "legacy-task-1",
+        "lastResultAt": "2026-08-15T10:00:00.000Z",
+        "lastIncrementalAt": "2026-08-15T10:05:00.000Z",
+        "lastFullAttemptAt": "2026-08-01T00:00:00.000Z",
+        "lastFullReconciledAt": "2026-08-01T00:05:00.000Z",
+        "requestedDepth": 25,
+        "itemsCount": 12,
+        "reviewsCount": 40,
+        "incompleteReason": null
+      },
       "Berlin": { "lastAcceptedTaskId": "legacy-task-2", "lastResultAt": "2026-08-10T10:00:00.000Z" }
     }
   },

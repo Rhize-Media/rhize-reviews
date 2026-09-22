@@ -95,6 +95,22 @@ describe("migrateSnapshot", () => {
       },
     ])
     expect(result?.metadata.totalReviews).toBe(2)
+
+    expect(result?.metadata.perLocation.vineland).toMatchObject({
+      lastResultAt: "2026-08-15T10:00:00.000Z",
+      lastIncrementalAt: "2026-08-15T10:05:00.000Z",
+      lastFullAttemptAt: "2026-08-01T00:00:00.000Z",
+      lastFullReconciledAt: "2026-08-01T00:05:00.000Z",
+      requestedDepth: 25,
+      itemsCount: 12,
+      reviewsCount: 40,
+      lastAcceptedTaskId: "legacy-task-1",
+    })
+    expect(result?.metadata.perLocation.berlin).toMatchObject({
+      lastResultAt: "2026-08-10T10:00:00.000Z",
+      lastAcceptedTaskId: "legacy-task-2",
+    })
+    expect(result?.metadata.perLocation.berlin).not.toHaveProperty("requestedDepth")
   })
 
   it("migrates an NCS legacy snapshot to v3 with a single location", () => {
@@ -109,15 +125,17 @@ describe("migrateSnapshot", () => {
     expect(result?.schemaVersion).toBe(3)
     expect(result?.reviews).toHaveLength(2)
 
+    // Proves the real NCS `reviewId` field (not an array-index fallback) survives migration.
     const first = result?.reviews.find(r => r.id === "ncs-1")
     expect(first).toMatchObject({
+      id: "ncs-1",
       locationKey: "vineland",
       authorName: "Carol",
       text: "Very happy with the result",
       publishedAt: "2026-08-12T09:00:00.000Z",
       relativeTime: "8 days ago",
       rating: 5,
-      ownerReply: { text: "Thank you Carol!" },
+      ownerReply: { text: "Thank you Carol!", publishedAt: "2026-08-13T09:00:00.000Z" },
       displayable: true,
     })
 
@@ -164,7 +182,7 @@ describe("migrateSnapshot", () => {
     const raw = {
       items: [
         {
-          id: "ncs-star-only",
+          reviewId: "ncs-star-only",
           profileName: "Frank",
           reviewText: "",
           timestamp: NOW,
@@ -195,5 +213,21 @@ describe("migrateSnapshot", () => {
     ).toBeNull()
     expect(migrateSnapshot(null, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
     expect(migrateSnapshot("nope", { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
+  })
+
+  it("does not misclassify a blob carrying schemaVersion as NCS legacy", () => {
+    const raw = { schemaVersion: 2, items: [{ reviewId: "x", rating: 5 }], totalCount: 1 }
+    expect(migrateSnapshot(raw, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
+  })
+
+  it("does not classify NCS-shaped items missing reviewId or rating as NCS legacy", () => {
+    const missingReviewId = { items: [{ profileName: "X", rating: 5 }], totalCount: 1 }
+    expect(migrateSnapshot(missingReviewId, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
+
+    const missingRating = { items: [{ reviewId: "x", profileName: "X" }], totalCount: 1 }
+    expect(migrateSnapshot(missingRating, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
+
+    const emptyItems = { items: [], totalCount: 0 }
+    expect(migrateSnapshot(emptyItems, { businessName: "Biz", locations: LOCATIONS, now: NOW })).toBeNull()
   })
 })

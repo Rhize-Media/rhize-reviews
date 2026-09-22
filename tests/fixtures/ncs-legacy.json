@@ -1,7 +1,7 @@
 {
   "items": [
     {
-      "id": "ncs-1",
+      "reviewId": "ncs-1",
       "profileName": "Carol",
       "reviewText": "Very happy with the result",
       "timestamp": "2026-08-12T09:00:00.000Z",
@@ -9,10 +9,11 @@
       "rating": 5,
       "reviewUrl": "https://example.com/reviews/ncs-1",
       "profileImageUrl": "https://example.com/carol.jpg",
-      "ownerAnswer": "Thank you Carol!"
+      "ownerAnswer": "Thank you Carol!",
+      "ownerTimestamp": "2026-08-13T09:00:00.000Z"
     },
     {
-      "id": "ncs-2",
+      "reviewId": "ncs-2",
       "profileName": "Dave",
       "reviewText": "Solid work",
       "timestamp": "2026-08-05T09:00:00.000Z",

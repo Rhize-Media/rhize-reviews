@@ -43,6 +43,16 @@ describe("parsePostbackBody", () => {
     }
   })
 
+  it("throws payload_too_large for an uncompressed body over maxBytes, before any decode", () => {
+    const oversized = bytesOf("x".repeat(101))
+    expect(() => parsePostbackBody(oversized, 100)).toThrow(ReviewsError)
+    try {
+      parsePostbackBody(oversized, 100)
+    } catch (error) {
+      expect((error as ReviewsError).code).toBe("payload_too_large")
+    }
+  })
+
   it("throws payload_too_large when the inflated gzip bomb exceeds maxOutputLength", () => {
     const big = "x".repeat(1_000_000)
     const payload = { status_code: 20000, tasks: [], padding: big }

@@ -22,6 +22,10 @@ function isBufferTooLarge(error: unknown): boolean {
  * or parse failure.
  */
 export function parsePostbackBody(bytes: Uint8Array, maxBytes = 10 * 1024 * 1024): unknown {
+  if (bytes.byteLength > maxBytes) {
+    throw new ReviewsError("payload_too_large", "Postback payload exceeds the maximum allowed size")
+  }
+
   let decoded: Uint8Array
 
   if (isGzip(bytes)) {
