@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto"
 import { ReviewsError } from "./errors.js"
+import { describeReport } from "./report.js"
 import { createReviewTasks, buildPostbackUrl, encodeTag, getTaskResult, listReadyTasks, parseTag } from "./dataforseo.js"
 import { selectTaskRequests } from "./cron.js"
 import { normalizeReviewItem, parseListingSummary } from "./normalize.js"
@@ -41,7 +42,7 @@ export interface ReviewsClient {
   assertConfigured(): void
   isCronAuthorized(headers: Headers): boolean
   isWebhookAuthorized(query: URLSearchParams): boolean
-  reportError: ReviewsConfig["hooks"]["reportError"]
+  reportError: (error: unknown, context?: Record<string, unknown>) => void
 }
 
 
@@ -131,6 +132,8 @@ function parseDataForSeoDatetime(value: unknown): string | null {
   return new Date(ms).toISOString()
 }
 
+const DATAFORSEO_NO_SEARCH_RESULTS = 40102
+
 function isStorageError(error: unknown): error is ReviewsError {
   return (
     error instanceof ReviewsError &&
@@ -141,6 +144,10 @@ function isStorageError(error: unknown): error is ReviewsError {
 }
 
 export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDeps = {}): ReviewsClient {
+  /** Every report goes through here so the hook always receives a ReportHint. */
+  function report(error: unknown, context: Record<string, unknown> = {}): void {
+    config.hooks.reportError(error, context, describeReport(error, context))
+  }
   const legacyLocationKeys = deps.legacyLocationKeys
   const storage = deps.storage ?? createStorage(config, legacyLocationKeys ? { legacyLocationKeys } : {})
   const fetchImpl = deps.fetchImpl ?? fetch
@@ -156,6 +163,14 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     if (!config.webhook.secret) missing.push("webhook.secret")
     if (!config.cron.secret) missing.push("cron.secret")
     if (!config.storage.storeId && !config.storage.allowReadWriteToken) missing.push("storage.storeId")
+    for (const location of config.locations) {
+      // DataForSEO location_name is "City,Region,Country" with NO space after the
+      // commas; "New Jersey, United States" fails every task with status 40501.
+      const name = location.locationName
+      if (!name || name !== name.trim() || /,\s/.test(name)) {
+        missing.push(`locations.${location.key}.locationName (comma-separated, no spaces after commas)`)
+      }
+    }
 
     if (!config.webhook.publicBaseUrl) {
       missing.push("webhook.publicBaseUrl")
@@ -285,11 +300,19 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     }
 
     if (rawTask.status_code !== 20000) {
-      config.hooks.reportError(
-        new ReviewsError("task_failed", `DataForSEO task returned status_code ${rawTask.status_code}`),
-        { taskId: rawTask.id, source },
+      // 40102 = DataForSEO found no business for the identifier: an operational
+      // condition (wrong cid/place id, listing removed), not a pipeline failure.
+      const code = rawTask.status_code === DATAFORSEO_NO_SEARCH_RESULTS ? "task_no_results" : "task_failed"
+      const hintTagRaw = isRecord(rawTask.data) ? rawTask.data.tag : undefined
+      const hintTag = typeof hintTagRaw === "string" ? parseTag(hintTagRaw, legacyLocationKeys) : null
+      report(
+        new ReviewsError(code, `DataForSEO task returned status_code ${rawTask.status_code}`, {
+          statusCode: rawTask.status_code,
+          ...(typeof rawTask.status_message === "string" ? { statusMessage: rawTask.status_message } : {}),
+        }),
+        { taskId: rawTask.id, source, ...(hintTag ? { locationKey: hintTag.locationKey } : {}) },
       )
-      return errorResult(422, "task_failed")
+      return errorResult(422, code)
     }
 
     if (source === "postback" && opts.queryId != null && opts.queryId !== rawTask.id) {
@@ -321,7 +344,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
 
     const resultAt = parseDataForSeoDatetime(rawResult.datetime)
     if (resultAt === null) {
-      config.hooks.reportError(
+      report(
         new ReviewsError("result_datetime_invalid", "DataForSEO result.datetime is missing or not in the expected format"),
         { taskId: rawTask.id, source, datetime: rawResult.datetime },
       )
@@ -342,7 +365,8 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       resultAt,
       requestedDepth: depth,
       itemsCount: rawItems.length,
-      reviewsCount: listingSummary.reviewsCount ?? reviews.length,
+      // The listing count can lag or under-report; never claim fewer than we hold.
+      reviewsCount: Math.max(listingSummary.reviewsCount ?? 0, reviews.length),
       invalidItemsCount,
       reviews,
       removalEnabled: mode === "full" && (config.sync?.removalEnabled ?? false),
@@ -355,7 +379,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       outcome = await storage.writeReconciled(batch)
     } catch (error) {
       if (isStorageError(error)) {
-        config.hooks.reportError(error, { taskId: batch.taskId, locationKey: batch.locationKey, source })
+        report(error, { taskId: batch.taskId, locationKey: batch.locationKey, source })
         return storageUnavailableResult()
       }
       throw error
@@ -364,14 +388,14 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     try {
       await storage.removePendingTask(batch.taskId)
     } catch (error) {
-      config.hooks.reportError(error, { taskId: batch.taskId, operation: "removePendingTask" })
+      report(error, { taskId: batch.taskId, operation: "removePendingTask" })
     }
 
     if (outcome.written) {
       try {
         await config.hooks.revalidate()
       } catch (error) {
-        config.hooks.reportError(error, { taskId: batch.taskId, operation: "revalidate" })
+        report(error, { taskId: batch.taskId, operation: "revalidate" })
       }
     }
 
@@ -410,12 +434,23 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       const parsedTag = tag ? parseTag(tag, legacyLocationKeys) : null
       if (!parsedTag || !ownLocationKeys.has(parsedTag.locationKey)) continue
 
-      const envelope = await getTaskResult(config.dataforseo, taskId, fetchImpl)
-      const result = await processTaskEnvelope(envelope, "recovery")
+      let result: Awaited<ReturnType<typeof processTaskEnvelope>>
+      try {
+        const envelope = await getTaskResult(config.dataforseo, taskId, fetchImpl)
+        result = await processTaskEnvelope(envelope, "recovery")
+      } catch (error) {
+        // One bad task_get (timeout, 404, transport) must not abort the rest of
+        // the recovery loop or the task_post that follows it in runRefresh.
+        report(
+          new ReviewsError("recovery_task_failed", `Recovery task threw${error instanceof Error && error.message ? `: ${error.message}` : ""}`, { taskId, cause: error }),
+          { taskId, operation: "recovery" },
+        )
+        continue
+      }
       if (result.status === 200) {
         recovered.push({ taskId: result.body.taskId, locationKey: result.body.locationKey, decision: result.body.decision })
       } else {
-        config.hooks.reportError(
+        report(
           new ReviewsError("recovery_task_failed", "Recovery task failed the postback pipeline", {
             taskId,
             status: result.status,
@@ -475,7 +510,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       if (freshRead?.snapshot.lastUpdated) {
         const ageMs = now.getTime() - Date.parse(freshRead.snapshot.lastUpdated)
         if (ageMs > staleAfterDays * DAY_MS) {
-          config.hooks.reportError(new ReviewsError("snapshot_stale", "Reviews snapshot has not been refreshed recently"), {
+          report(new ReviewsError("snapshot_stale", "Reviews snapshot has not been refreshed recently"), {
             lastUpdated: freshRead.snapshot.lastUpdated,
             ageMs,
           })
@@ -530,7 +565,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
           await storage.clearFullLease(rejectedFullLocations)
         }
         for (const rejection of rejected) {
-          config.hooks.reportError(
+          report(
             new ReviewsError("task_rejected", `DataForSEO rejected the task for ${rejection.locationKey}: ${rejection.statusMessage}`, rejection),
             { locationKey: rejection.locationKey },
           )
@@ -545,7 +580,7 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
       try {
         await storage.releaseCronLease(leaseOwner)
       } catch (error) {
-        config.hooks.reportError(error, { operation: "releaseCronLease" })
+        report(error, { operation: "releaseCronLease" })
       }
     }
   }
@@ -559,6 +594,6 @@ export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDe
     assertConfigured,
     isCronAuthorized,
     isWebhookAuthorized,
-    reportError: config.hooks.reportError,
+    reportError: report,
   }
 }

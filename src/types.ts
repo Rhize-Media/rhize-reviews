@@ -1,3 +1,4 @@
+import type { ReportHint } from "./report.js"
 export type ReviewIdentifier = { cid: string } | { placeId: string } | { keyword: string }
 
 export interface ReviewLocation {
@@ -115,7 +116,7 @@ export interface ReconciliationResult {
 export interface ReviewsConfig {
   businessName: string
   locations: ReviewLocation[]
-  dataforseo: { login: string; password: string; baseUrl?: string }
+  dataforseo: { login: string; password: string; baseUrl?: string; /** Per-request fetch timeout (default 20 000 ms). */ timeoutMs?: number }
   webhook: { secret: string; publicBaseUrl: string }
   cron: { secret: string }
   storage: { storeId?: string; allowReadWriteToken?: boolean; pathname?: string }
@@ -126,7 +127,11 @@ export interface ReviewsConfig {
     staleAfterDays?: number
     fullCooldownDays?: number
   }
-  hooks: { reportError: (error: unknown, context: Record<string, unknown>) => void; revalidate: () => void | Promise<void> }
+  hooks: {
+    /** Third argument (grouping/severity hint) is optional to implement; 2-arg hooks remain valid. */
+    reportError: (error: unknown, context: Record<string, unknown>, hint: ReportHint) => void
+    revalidate: () => void | Promise<void>
+  }
   now?: () => Date
 }
 

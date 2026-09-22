@@ -5,6 +5,12 @@ const DEFAULT_BASE_URL = "https://api.dataforseo.com/v3"
 
 type DataForSEOConfig = ReviewsConfig["dataforseo"]
 
+const DEFAULT_TIMEOUT_MS = 20_000
+
+function requestSignal(cfg: DataForSEOConfig): AbortSignal {
+  return AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+}
+
 function authHeader(cfg: DataForSEOConfig): string {
   return `Basic ${Buffer.from(`${cfg.login}:${cfg.password}`).toString("base64")}`
 }
@@ -105,6 +111,7 @@ export async function createReviewTasks(
     method: "POST",
     headers: { Authorization: authHeader(cfg), "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal: requestSignal(cfg),
   })
 
   if (!response.ok) {
@@ -158,6 +165,7 @@ export async function listReadyTasks(
   const response = await fetchImpl(`${baseUrl(cfg)}/business_data/google/reviews/tasks_ready`, {
     method: "GET",
     headers: { Authorization: authHeader(cfg) },
+    signal: requestSignal(cfg),
   })
 
   if (!response.ok) {
@@ -173,6 +181,7 @@ export async function getTaskResult(cfg: DataForSEOConfig, taskId: string, fetch
   const response = await fetchImpl(`${baseUrl(cfg)}/business_data/google/reviews/task_get/${taskId}`, {
     method: "GET",
     headers: { Authorization: authHeader(cfg) },
+    signal: requestSignal(cfg),
   })
 
   if (!response.ok) {

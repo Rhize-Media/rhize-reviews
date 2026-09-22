@@ -1,6 +1,6 @@
 {
   "name": "@rhize/reviews",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Google reviews pipeline for Next.js sites: DataForSEO task → postback webhook → private Vercel Blob snapshot → cached reader",
   "license": "MIT",
   "repository": {
@@ -24,6 +24,10 @@
     "./next": {
       "types": "./dist/next/index.d.ts",
       "import": "./dist/next/index.js"
+    },
+    "./sentry": {
+      "types": "./dist/sentry/index.d.ts",
+      "import": "./dist/sentry/index.js"
     }
   },
   "sideEffects": false,

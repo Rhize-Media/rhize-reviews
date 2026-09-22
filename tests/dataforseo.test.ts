@@ -248,3 +248,22 @@ describe("getTaskResult", () => {
     expect(result).toEqual(envelope)
   })
 })
+
+describe("request timeouts", () => {
+  it("attaches an AbortSignal to task_post, tasks_ready and task_get, honoring dataforseo.timeoutMs", async () => {
+    const seen: Array<{ url: string; signal: unknown }> = []
+    const fetchImpl = (async (url: string, init: RequestInit) => {
+      seen.push({ url, signal: init.signal })
+      if (url.includes("task_post")) return Response.json({ status_code: 20000, tasks: [{ id: "t", status_code: 20100 }] })
+      if (url.includes("tasks_ready")) return Response.json({ tasks: [{ result: [] }] })
+      return Response.json({ tasks: [{ id: "t", status_code: 20000, result: [] }] })
+    }) as unknown as typeof fetch
+    const timed = { ...cfg, timeoutMs: 1234 }
+    const request = { location: vinelandCid, mode: "incremental" as const, depth: 10, tag: encodeTag("vineland", "incremental", 10), postbackUrl: "https://example.com/api/webhooks/dataforseo?secret=s" }
+    await createReviewTasks(timed, [request], fetchImpl)
+    await listReadyTasks(timed, fetchImpl)
+    await getTaskResult(timed, "t", fetchImpl)
+    expect(seen).toHaveLength(3)
+    for (const call of seen) expect(call.signal).toBeInstanceOf(AbortSignal)
+  })
+})

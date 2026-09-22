@@ -642,6 +642,24 @@ describe("createStorage: leases", () => {
     expect(afterClear).toEqual(["vineland"])
   })
 
+  it("prunes pending-task entries older than 24 h when recording new ones (lost postbacks)", async () => {
+    const deps = makeDeps()
+    const empty = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    const stale = { taskId: "old", locationKey: "vineland", mode: "incremental" as const, depth: 10, createdAt: new Date(Date.parse(NOW) - 25 * 60 * 60 * 1000).toISOString() }
+    const recent = { taskId: "recent", locationKey: "berlin", mode: "incremental" as const, depth: 10, createdAt: new Date(Date.parse(NOW) - 2 * 60 * 60 * 1000).toISOString() }
+    let stored: ReviewsSnapshot = { ...empty, metadata: { ...empty.metadata, pendingTasks: [stale, recent] } }
+    deps.get.mockImplementation(async () => blobResult(stored, '"etag-1"'))
+    deps.put.mockImplementation(async (_p: string, body: string) => {
+      stored = JSON.parse(body) as ReviewsSnapshot
+      return { etag: '"etag-2"' }
+    })
+    const storage = createStorage(baseConfig(), deps)
+
+    await storage.recordPendingTasks([{ taskId: "new", locationKey: "vineland", mode: "incremental", depth: 10 }])
+
+    expect(stored.metadata.pendingTasks.map(t => t.taskId)).toEqual(["recent", "new"])
+  })
+
   it("records and removes pending tasks", async () => {
     const deps = makeDeps()
     let stored = createEmptySnapshot("Biz", LOCATIONS, NOW)

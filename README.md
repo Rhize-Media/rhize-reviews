@@ -66,6 +66,29 @@ export const reviewsClient = createReviewsClient({
 })
 ```
 
+### Error reporting
+
+Every `hooks.reportError(error, context, hint)` call carries a `ReportHint`
+(`level`, `tags`, optional `fingerprint` and `message`) computed by
+`describeReport`, so recurring operational conditions — a drained DataForSEO
+balance (`dataforseo_billing`), a stale snapshot, a missing env var, an
+exhausted CAS retry, a per-location task rejection — collapse into one tracker
+issue instead of one event per cron run. Two ready-made hooks apply it:
+
+```ts
+// Sentry sites — `@rhize/reviews/sentry` never imports @sentry/*; pass your SDK in.
+import * as Sentry from "@sentry/nextjs"
+import { createSentryReporter } from "@rhize/reviews/sentry"
+hooks: { reportError: createSentryReporter(Sentry), revalidate }
+
+// Sites without a tracker — one log line per report: `[reviews] error dataforseo_billing — …`
+import { createConsoleReporter } from "@rhize/reviews"
+hooks: { reportError: createConsoleReporter(), revalidate }
+```
+
+A two-argument hook (`(error, context) => …`) still type-checks; it just ignores
+the hint. `dataforseo.timeoutMs` (default 20 000) bounds every DataForSEO request. Hints and `extra` never include the error's `cause` or the postback URL.
+
 `storage` uses store-scoped auth: `storeId` plus a `@vercel/oidc` token. A raw
 `BLOB_READ_WRITE_TOKEN` is only honored when you explicitly set
 `storage.allowReadWriteToken: true` — production adapters should never set it.

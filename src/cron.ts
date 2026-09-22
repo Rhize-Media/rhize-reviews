@@ -3,6 +3,8 @@ import type { ReviewLocation, ReviewSyncMode, ReviewsSnapshot } from "./types.js
 const FULL_DEPTH_FLOOR = 100
 const FULL_DEPTH_CEILING = 500
 const PENDING_TASK_LIVE_WINDOW_MS = 60 * 60 * 1000
+/** Pending-task entries older than this are dropped on the next cron write (lost postbacks). */
+export const PENDING_TASK_MAX_AGE_MS = 24 * 60 * 60 * 1000
 const DAY_MS = 24 * 60 * 60 * 1000
 
 export function selectTaskRequests(

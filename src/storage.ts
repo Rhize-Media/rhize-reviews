@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto"
 import { BlobError, BlobPreconditionFailedError, get, put } from "@vercel/blob"
 import { getVercelOidcToken } from "@vercel/oidc"
 import { ReviewsError } from "./errors.js"
+import { describeReport } from "./report.js"
+import { PENDING_TASK_MAX_AGE_MS } from "./cron.js"
 import { migrateSnapshot } from "./migrate.js"
 import { createEmptySnapshot, reconcileReviews } from "./reconcile.js"
 import type { ReconciliationBatch, ReconciliationResult, ReviewSyncMode, ReviewsConfig, ReviewsSnapshot } from "./types.js"
@@ -145,7 +147,7 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
         }
         return null
       } catch (error) {
-        cfg.hooks.reportError(error, { operation: "readForDisplay" })
+        cfg.hooks.reportError(error, { operation: "readForDisplay" }, describeReport(error, { operation: "readForDisplay" }))
         if (lastKnownSnapshot) {
           return { ...lastKnownSnapshot, readState: { stale: true, reason: "storage_unavailable" } }
         }
@@ -326,11 +328,17 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
     if (accepted.length === 0) return
     await updateMetadata(snapshot => {
       const createdAt = nowIso()
+      const cutoff = Date.parse(createdAt) - PENDING_TASK_MAX_AGE_MS
+      // Entries whose postback never arrived would otherwise accumulate forever.
+      const live = snapshot.metadata.pendingTasks.filter(task => {
+        const at = Date.parse(task.createdAt)
+        return !Number.isFinite(at) || at >= cutoff
+      })
       return {
         ...snapshot,
         metadata: {
           ...snapshot.metadata,
-          pendingTasks: [...snapshot.metadata.pendingTasks, ...accepted.map(task => ({ ...task, createdAt }))],
+          pendingTasks: [...live, ...accepted.map(task => ({ ...task, createdAt }))],
         },
       }
     })

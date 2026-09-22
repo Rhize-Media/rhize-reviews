@@ -258,6 +258,50 @@ describe("handlePostback: shape and location resolution", () => {
     expect(cfg.hooks.reportError).toHaveBeenCalled()
   })
 
+  it("reports DataForSEO 40102 (no business matched) as task_no_results, per location, with 422", async () => {
+    const cfg = baseConfig()
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ status_code: 40102, tag: "rhize-reviews:vineland:incremental:10" })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.status).toBe(422)
+    expect(result.body).toMatchObject({ error: "task_no_results" })
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "task_no_results", extra: expect.objectContaining({ statusCode: 40102 }) }),
+      expect.objectContaining({ locationKey: "vineland" }),
+      expect.objectContaining({ level: "warning", fingerprint: ["rhize-reviews", "task_no_results", "vineland"] }),
+    )
+  })
+
+  it("keeps other non-20000 statuses as task_failed carrying the status code", async () => {
+    const cfg = baseConfig()
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    const result = await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ status_code: 40501 })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    expect(result.body).toMatchObject({ error: "task_failed" })
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "task_failed", extra: expect.objectContaining({ statusCode: 40501 }) }),
+      expect.anything(),
+      expect.objectContaining({ level: "error" }),
+    )
+  })
+
+  it("never claims fewer reviews than the batch holds when the listing count under-reports", async () => {
+    const storage = fakeStorage()
+    const client = createReviewsClient(baseConfig(), { storage })
+    await client.handlePostback({
+      bytes: bytesOf(taskEnvelope({ tag: "rhize-reviews:vineland:incremental:10", reviews_count: 0 })),
+      query: new URLSearchParams({ secret: "s3cret" }),
+    })
+    const batch = (storage.writeReconciled as ReturnType<typeof vi.fn>).mock.calls[0]![0] as ReconciliationBatch
+    expect(batch.reviews.length).toBeGreaterThan(0)
+    expect(batch.reviewsCount).toBe(batch.reviews.length)
+    expect(batch.listingReviewCount).toBe(0)
+  })
+
   it("rejects a ?id that does not equal tasks[0].id with 422", async () => {
     const client = createReviewsClient(baseConfig(), { storage: fakeStorage() })
     const result = await client.handlePostback({
@@ -477,7 +521,27 @@ describe("reportError", () => {
     const error = new Error("boom")
     client.reportError(error, { handler: "refreshReviewsGET" })
 
-    expect(reportError).toHaveBeenCalledWith(error, { handler: "refreshReviewsGET" })
+    expect(reportError).toHaveBeenCalledWith(
+      error,
+      { handler: "refreshReviewsGET" },
+      expect.objectContaining({ code: "unknown", level: "error", tags: { "reviews.code": "unknown" } }),
+    )
+  })
+})
+
+describe("assertConfigured: locationName format", () => {
+  it("rejects a locationName with a space after a comma (DataForSEO 40501) as not_configured", () => {
+    const cfg = baseConfig()
+    cfg.locations = [{ ...SINGLE_LOCATION, locationName: "New Jersey, United States" }]
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    expect(() => client.assertConfigured()).toThrowError(/locations\.vineland\.locationName/)
+  })
+
+  it("accepts the documented comma-separated form", () => {
+    const cfg = baseConfig()
+    cfg.locations = [{ ...SINGLE_LOCATION, locationName: "Vineland,New Jersey,United States" }]
+    const client = createReviewsClient(cfg, { storage: fakeStorage() })
+    expect(() => client.assertConfigured()).not.toThrow()
   })
 })
 
@@ -514,6 +578,33 @@ describe("recoverReadyTasks", () => {
 
     expect(recovered).toEqual([{ taskId: "ready-1", locationKey: "vineland", decision: "applied" }])
     expect(fetchImpl).toHaveBeenCalledTimes(2) // tasks_ready + one task_get (not two)
+  })
+
+  it("isolates a task_get failure: reports recovery_task_failed and still recovers the next task", async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("tasks_ready")) {
+        return Response.json({
+          tasks: [{ result: [
+            { id: "broken-1", tag: "rhize-reviews:vineland:incremental:10" },
+            { id: "ready-2", tag: "rhize-reviews:vineland:incremental:10" },
+          ] }],
+        })
+      }
+      if (url.includes("task_get/broken-1")) throw new Error("socket hang up")
+      if (url.includes("task_get/ready-2")) return Response.json(taskEnvelope({ id: "ready-2", tag: "rhize-reviews:vineland:incremental:10" }))
+      throw new Error(`unexpected fetch ${url}`)
+    }) as unknown as typeof fetch
+    const cfg = baseConfig()
+    const client = createReviewsClient(cfg, { storage: fakeStorage(), fetchImpl })
+
+    const recovered = await client.recoverReadyTasks()
+
+    expect(recovered).toEqual([{ taskId: "ready-2", locationKey: "vineland", decision: "applied" }])
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "recovery_task_failed", message: "Recovery task threw: socket hang up" }),
+      { taskId: "broken-1", operation: "recovery" },
+      expect.anything(),
+    )
   })
 
   it("skips a ready task tagged for another tenant's location without calling task_get", async () => {
@@ -594,7 +685,7 @@ describe("runRefresh", () => {
     const result = await client.runRefresh()
 
     expect(result.ok).toBe(true)
-    expect(cfg.hooks.reportError).toHaveBeenCalledWith(expect.any(Error), { operation: "releaseCronLease" })
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(expect.any(Error), { operation: "releaseCronLease" }, expect.objectContaining({ level: "error" }))
   })
 
   it("a releaseCronLease failure is swallowed and never masks a thrown error from the run itself", async () => {
@@ -671,7 +762,11 @@ describe("runRefresh", () => {
     const cfg = baseConfig({ sync: { staleAfterDays: 14 } })
     const client = createReviewsClient(cfg, { storage, fetchImpl: refreshDeps() })
     await client.runRefresh()
-    expect(cfg.hooks.reportError).toHaveBeenCalledWith(expect.objectContaining({ code: "snapshot_stale" }), expect.anything())
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(
+      expect.objectContaining({ code: "snapshot_stale" }),
+      expect.anything(),
+      expect.objectContaining({ code: "snapshot_stale", level: "warning", fingerprint: ["rhize-reviews", "snapshot_stale"] }),
+    )
   })
 
   it("requests a full task when forceFull is set and full reconciliation is enabled", async () => {
