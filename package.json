@@ -1,15 +1,30 @@
 {
   "name": "@rhize/reviews",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.0",
   "description": "Google reviews pipeline for Next.js sites: DataForSEO task → postback webhook → private Vercel Blob snapshot → cached reader",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/Rhize-Media/rhize-reviews.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rhize-Media/rhize-reviews.git"
+  },
   "type": "module",
-  "engines": { "node": ">=20" },
-  "files": ["dist", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./next": { "types": "./dist/next/index.d.ts", "import": "./dist/next/index.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./next": {
+      "types": "./dist/next/index.d.ts",
+      "import": "./dist/next/index.js"
+    }
   },
   "sideEffects": false,
   "scripts": {
@@ -29,5 +44,8 @@
     "typescript": "^5.9.0",
     "vitest": "^4.1.0"
   },
-  "publishConfig": { "access": "public", "provenance": true }
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
 }
