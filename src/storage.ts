@@ -18,6 +18,10 @@ export interface StorageDeps {
   get?: BlobGet
   put?: BlobPut
   getOidcToken?: () => Promise<string>
+  /** Maps a legacy display name (e.g. `"Vineland"`) to its configured
+   *  location key (e.g. `"vineland"`), threaded into every migration this
+   *  storage instance performs. */
+  legacyLocationKeys?: Record<string, string>
 }
 
 type FreshRead = { snapshot: ReviewsSnapshot; etag: string | null; source: "v3" | "legacy" | "none" }
@@ -67,7 +71,12 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
   }
 
   function migrateContext() {
-    return { businessName: cfg.businessName, locations: cfg.locations, now: nowIso() }
+    return {
+      businessName: cfg.businessName,
+      locations: cfg.locations,
+      now: nowIso(),
+      ...(deps.legacyLocationKeys ? { legacyLocationKeys: deps.legacyLocationKeys } : {}),
+    }
   }
 
   /** Throws `storage_unsupported_schema` for a `schemaVersion` newer than this

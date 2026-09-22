@@ -47,6 +47,142 @@ describe("migrateSnapshot", () => {
     expect(result?.metadata.businessName).toBe("Biz")
   })
 
+  it("returns an already-correctly-keyed v3 snapshot byte-equivalent, even with legacyLocationKeys set", () => {
+    const v3: ReviewsSnapshot = {
+      schemaVersion: 3,
+      lastUpdated: NOW,
+      reviews: [
+        {
+          id: "r1",
+          locationKey: "vineland",
+          authorName: "Alice",
+          rating: 5,
+          text: "Great",
+          publishedAt: NOW,
+          displayable: true,
+        },
+      ],
+      metadata: {
+        businessName: "Biz",
+        averageRating: 5,
+        totalReviews: 1,
+        perLocation: { vineland: { count: 1, rating: 5, lastSyncMode: "incremental" } },
+        pendingTasks: [],
+      },
+      processedTasks: [{ taskId: "t1", locationKey: "vineland", mode: "incremental", resultAt: NOW, processedAt: NOW }],
+      tombstones: [{ key: "vineland:gone", firstMissingAt: NOW, lastMissingAt: NOW, removedAt: NOW, lastSourceAt: NOW }],
+    }
+
+    const result = migrateSnapshot(v3, {
+      businessName: "Biz",
+      locations: LOCATIONS,
+      now: NOW,
+      legacyLocationKeys: { Vineland: "vineland" },
+    })
+
+    const { readState: _readState, ...expected } = v3
+    expect(result).toEqual(expected)
+  })
+
+  it("self-heals a v3 snapshot whose reviews/tasks/tombstones/perLocation still carry a legacy display name", () => {
+    const v3WithLegacyKeys: ReviewsSnapshot = {
+      schemaVersion: 3,
+      lastUpdated: NOW,
+      reviews: [
+        {
+          id: "legacy-1",
+          locationKey: "Vineland",
+          authorName: "Alice",
+          rating: 5,
+          text: "Great",
+          publishedAt: NOW,
+          displayable: true,
+        },
+        {
+          id: "legacy-2",
+          locationKey: "Vineland",
+          authorName: "Bob",
+          rating: 3,
+          text: "Fine",
+          publishedAt: NOW,
+          displayable: true,
+        },
+        {
+          id: "new-1",
+          locationKey: "vineland",
+          authorName: "Carol",
+          rating: 4,
+          text: "Good",
+          publishedAt: NOW,
+          displayable: true,
+        },
+      ],
+      metadata: {
+        businessName: "Biz",
+        averageRating: 999, // deliberately stale — must be recomputed
+        totalReviews: 999,
+        perLocation: {
+          vineland: { count: 1, rating: 4, lastSyncMode: "incremental", lastAcceptedTaskId: "recent-task" },
+          Vineland: { count: 2, rating: 4, lastSyncMode: null },
+        },
+        pendingTasks: [],
+      },
+      processedTasks: [{ taskId: "legacy-task", locationKey: "Vineland", mode: "incremental", resultAt: NOW, processedAt: NOW }],
+      tombstones: [{ key: "Vineland:gone", firstMissingAt: NOW, lastMissingAt: NOW, removedAt: NOW, lastSourceAt: NOW }],
+    }
+
+    const result = migrateSnapshot(v3WithLegacyKeys, {
+      businessName: "Biz",
+      locations: LOCATIONS,
+      now: NOW,
+      legacyLocationKeys: { Vineland: "vineland" },
+    })
+
+    expect(result).not.toBeNull()
+    expect(result?.reviews.map(r => r.locationKey)).toEqual(["vineland", "vineland", "vineland"])
+    expect(result?.processedTasks[0]?.locationKey).toBe("vineland")
+    expect(result?.tombstones[0]?.key).toBe("vineland:gone")
+
+    // Only one "vineland" entry remains; the legacy "Vineland" entry is folded in
+    // without clobbering the already-correct entry's sync-state fields.
+    expect(Object.keys(result!.metadata.perLocation)).toEqual(["vineland"])
+    expect(result?.metadata.perLocation.vineland).toMatchObject({
+      lastSyncMode: "incremental",
+      lastAcceptedTaskId: "recent-task",
+    })
+
+    // Counts/ratings are recomputed from the (now correctly-keyed) reviews.
+    expect(result?.metadata.perLocation.vineland?.count).toBe(3)
+    expect(result?.metadata.perLocation.vineland?.rating).toBeCloseTo((5 + 3 + 4) / 3)
+    expect(result?.metadata.totalReviews).toBe(3)
+    expect(result?.metadata.averageRating).toBeCloseTo((5 + 3 + 4) / 3)
+  })
+
+  it("is idempotent: running the self-heal twice yields the same result", () => {
+    const v3WithLegacyKeys: ReviewsSnapshot = {
+      schemaVersion: 3,
+      lastUpdated: NOW,
+      reviews: [
+        { id: "legacy-1", locationKey: "Vineland", authorName: "Alice", rating: 5, text: "Great", publishedAt: NOW, displayable: true },
+      ],
+      metadata: {
+        businessName: "Biz",
+        averageRating: 0,
+        totalReviews: 0,
+        perLocation: { Vineland: { count: 1, rating: 5, lastSyncMode: null } },
+        pendingTasks: [],
+      },
+      processedTasks: [],
+      tombstones: [],
+    }
+    const ctx = { businessName: "Biz", locations: LOCATIONS, now: NOW, legacyLocationKeys: { Vineland: "vineland" } }
+
+    const once = migrateSnapshot(v3WithLegacyKeys, ctx)
+    const twice = migrateSnapshot(once, ctx)
+
+    expect(twice).toEqual(once)
+  })
+
   it("migrates an SJG v2 snapshot to v3", () => {
     const raw = fixture("sjg-v2.json")
     const result = migrateSnapshot(raw, {

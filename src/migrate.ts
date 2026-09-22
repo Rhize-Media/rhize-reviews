@@ -14,6 +14,86 @@ function isV3Snapshot(raw: unknown): raw is ReviewsSnapshot {
   return isRecord(raw) && raw.schemaVersion === 3
 }
 
+/**
+ * Self-heals a persisted v3 snapshot whose `locationKey` fields (reviews,
+ * `processedTasks`, tombstones) or `metadata.perLocation` keys still carry a
+ * legacy display name (e.g. `"Vineland"`) instead of the configured key
+ * (`"vineland"`) — this happens when a prior migration ran without
+ * `legacyLocationKeys` wired through. A legacy-named `perLocation` entry is
+ * folded into its mapped key without clobbering an already-correct entry's
+ * sync-state fields, and `count`/`rating`/`totalReviews`/`averageRating` are
+ * always recomputed from the (now correctly-keyed) reviews. Idempotent: a
+ * snapshot with no legacy-named keys anywhere is returned unchanged.
+ */
+function remapLegacyLocationKeys(snapshot: ReviewsSnapshot, ctx: MigrateContext): ReviewsSnapshot {
+  const legacyLocationKeys = ctx.legacyLocationKeys
+  if (!legacyLocationKeys || Object.keys(legacyLocationKeys).length === 0) return snapshot
+
+  const hasLegacyKey = (key: string): boolean => legacyLocationKeys[key] !== undefined
+  const mapKey = (key: string): string => legacyLocationKeys[key] ?? key
+
+  const needsRemap =
+    snapshot.reviews.some(review => hasLegacyKey(review.locationKey)) ||
+    snapshot.processedTasks.some(task => hasLegacyKey(task.locationKey)) ||
+    snapshot.tombstones.some(tombstone => hasLegacyKey(tombstone.key.slice(0, tombstone.key.indexOf(":")))) ||
+    Object.keys(snapshot.metadata.perLocation).some(hasLegacyKey)
+
+  if (!needsRemap) return snapshot
+
+  const reviews = snapshot.reviews.map(review =>
+    hasLegacyKey(review.locationKey) ? { ...review, locationKey: mapKey(review.locationKey) } : review,
+  )
+
+  const processedTasks = snapshot.processedTasks.map(task =>
+    hasLegacyKey(task.locationKey) ? { ...task, locationKey: mapKey(task.locationKey) } : task,
+  )
+
+  const tombstones = snapshot.tombstones.map(tombstone => {
+    const separatorIndex = tombstone.key.indexOf(":")
+    if (separatorIndex === -1) return tombstone
+    const name = tombstone.key.slice(0, separatorIndex)
+    if (!hasLegacyKey(name)) return tombstone
+    return { ...tombstone, key: `${mapKey(name)}${tombstone.key.slice(separatorIndex)}` }
+  })
+
+  // Correctly-keyed entries are kept as the base (their sync-state fields
+  // reflect genuine ongoing activity); legacy-named entries are folded in
+  // afterward, only filling fields the base doesn't already have.
+  const perLocation: Record<string, LocationSyncMetadata> = {}
+  const legacyPerLocationEntries: Array<[string, LocationSyncMetadata]> = []
+  for (const [key, value] of Object.entries(snapshot.metadata.perLocation)) {
+    if (hasLegacyKey(key)) {
+      legacyPerLocationEntries.push([mapKey(key), value])
+    } else {
+      perLocation[key] = value
+    }
+  }
+  for (const [mappedKey, value] of legacyPerLocationEntries) {
+    perLocation[mappedKey] = perLocation[mappedKey] ? { ...value, ...perLocation[mappedKey] } : value
+  }
+
+  const locationKeys = [...new Set([...ctx.locations.map(location => location.key), ...Object.keys(perLocation)])]
+  const aggregates = computeAggregates(reviews, locationKeys)
+  const recomputedPerLocation: Record<string, LocationSyncMetadata> = {}
+  for (const key of Object.keys(perLocation)) {
+    const computed = aggregates.perLocation[key] ?? { count: 0, rating: 0 }
+    recomputedPerLocation[key] = { ...perLocation[key]!, count: computed.count, rating: computed.rating }
+  }
+
+  return {
+    ...snapshot,
+    reviews,
+    processedTasks,
+    tombstones,
+    metadata: {
+      ...snapshot.metadata,
+      totalReviews: aggregates.totalReviews,
+      averageRating: aggregates.averageRating,
+      perLocation: recomputedPerLocation,
+    },
+  }
+}
+
 function isSjgV2(raw: unknown): raw is Record<string, unknown> {
   if (!isRecord(raw)) return false
   const reviews = raw.reviews
@@ -213,7 +293,7 @@ function migrateNcsLegacy(raw: Record<string, unknown>, ctx: MigrateContext): Re
 export function migrateSnapshot(raw: unknown, ctx: MigrateContext): ReviewsSnapshot | null {
   if (isV3Snapshot(raw)) {
     const { readState: _readState, ...rest } = raw
-    return rest as ReviewsSnapshot
+    return remapLegacyLocationKeys(rest as ReviewsSnapshot, ctx)
   }
 
   if (isSjgV2(raw)) return migrateSjgV2(raw, ctx)

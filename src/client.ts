@@ -141,9 +141,9 @@ function isStorageError(error: unknown): error is ReviewsError {
 }
 
 export function createReviewsClient(config: ReviewsConfig, deps: ReviewsClientDeps = {}): ReviewsClient {
-  const storage = deps.storage ?? createStorage(config)
-  const fetchImpl = deps.fetchImpl ?? fetch
   const legacyLocationKeys = deps.legacyLocationKeys
+  const storage = deps.storage ?? createStorage(config, legacyLocationKeys ? { legacyLocationKeys } : {})
+  const fetchImpl = deps.fetchImpl ?? fetch
 
   function nowDate(): Date {
     return config.now?.() ?? new Date()

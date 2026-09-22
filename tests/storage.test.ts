@@ -140,6 +140,42 @@ describe("createStorage: readFresh", () => {
     expect(deps.put).not.toHaveBeenCalled()
   })
 
+  it("plumbs deps.legacyLocationKeys into migration, mapping the legacy display name to the configured key", async () => {
+    const deps = makeDeps()
+    deps.get.mockImplementation(async (pathname: string) => {
+      if (pathname === "google-reviews/reviews.v3.json") return null
+      if (pathname === "google-reviews/reviews.json") {
+        return blobResult(
+          {
+            schemaVersion: 2,
+            lastUpdated: NOW,
+            reviews: [
+              {
+                id: "legacy-1",
+                location: "Vineland",
+                content: "Legacy review",
+                date: NOW,
+                author: "Legacy Author",
+                rating: "5",
+                displayable: true,
+              },
+            ],
+            metadata: { businessName: "Biz", locationBreakdown: { Vineland: 1 } },
+            processedTasks: [],
+            tombstones: [],
+          },
+          '"legacy-etag"',
+        )
+      }
+      throw new Error(`unexpected pathname ${pathname}`)
+    })
+    const storage = createStorage(baseConfig(), { ...deps, legacyLocationKeys: { Vineland: "vineland" } })
+
+    const fresh = await storage.readFresh()
+
+    expect(fresh?.snapshot.reviews[0]).toMatchObject({ id: "legacy-1", locationKey: "vineland" })
+  })
+
   it("returns null when neither pathname has a blob", async () => {
     const deps = makeDeps()
     deps.get.mockResolvedValue(null)

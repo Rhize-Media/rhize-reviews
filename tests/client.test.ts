@@ -2,8 +2,17 @@ import { gzipSync } from "node:zlib"
 import { describe, expect, it, vi } from "vitest"
 import { createReviewsClient } from "../src/client.js"
 import { createEmptySnapshot, reconcileReviews } from "../src/reconcile.js"
+import * as storageModule from "../src/storage.js"
 import { createStorage } from "../src/storage.js"
 import type { ReconciliationBatch, ReconciliationDecision, ReviewLocation, ReviewsConfig, ReviewsSnapshot } from "../src/types.js"
+
+// Every test in this file passes its own `deps.storage`, so wrapping the real
+// `createStorage` in a spy is safe file-wide: it's only actually invoked by
+// the one test below that checks what `createReviewsClient` passes it.
+vi.mock("../src/storage.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/storage.js")>("../src/storage.js")
+  return { ...actual, createStorage: vi.fn(actual.createStorage) }
+})
 
 type FakeStorage = ReturnType<typeof createStorage>
 
@@ -873,5 +882,24 @@ describe("fix round 1: empty configured secrets never authorize", () => {
       query: new URLSearchParams({ secret: "" }),
     })
     expect(result.status).toBe(401)
+  })
+})
+
+describe("0.1.1: legacyLocationKeys plumbed into storage.createStorage", () => {
+  it("passes deps.legacyLocationKeys through to createStorage when the client creates storage itself", () => {
+    const legacyLocationKeys = { Vineland: "vineland" }
+    createReviewsClient(baseConfig(), { legacyLocationKeys })
+
+    expect(vi.mocked(storageModule.createStorage)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ legacyLocationKeys }),
+    )
+  })
+
+  it("does not call createStorage at all when deps.storage is already provided", () => {
+    vi.mocked(storageModule.createStorage).mockClear()
+    createReviewsClient(baseConfig(), { storage: fakeStorage(), legacyLocationKeys: { Vineland: "vineland" } })
+
+    expect(storageModule.createStorage).not.toHaveBeenCalled()
   })
 })
