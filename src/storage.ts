@@ -35,8 +35,20 @@ function sleep(ms: number): Promise<void> {
 
 function isConflict(error: unknown): boolean {
   if (error instanceof BlobPreconditionFailedError) return true
-  if (error instanceof BlobError) return /precondition|etag|412/i.test(error.message)
+  if (error instanceof BlobError) {
+    if (/precondition|etag|412/i.test(error.message)) return true
+    // "This blob already exists, use `allowOverwrite: true`…" (HTTP 400): we only send
+    // allowOverwrite:false when readFresh() saw no v3 snapshot, so this means the v3 blob
+    // exists after all (transient read miss behind another instance's overwrite). Re-read
+    // and retry like any other conflict. The SDK maps this 400 to a generic BlobError with
+    // no code, so the message / doc-link slug is the only handle.
+    if (/already exists|blob-allow-overwrite/i.test(error.message)) return true
+  }
   return false
+}
+
+function describeCause(error: unknown): string {
+  return error instanceof Error && error.message ? `: ${error.message}` : ""
 }
 
 export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
@@ -185,7 +197,7 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
         }
         throw new ReviewsError("storage_conflict_exhausted", "Exhausted CAS write retries")
       }
-      throw new ReviewsError("storage_unavailable", "Failed to write reviews snapshot", { cause: error })
+      throw new ReviewsError("storage_unavailable", `Failed to write reviews snapshot${describeCause(error)}`, { cause: error })
     }
   }
 
@@ -199,7 +211,7 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
       try {
         fresh = await readFresh()
       } catch (error) {
-        throw new ReviewsError("storage_unavailable", "Failed to read reviews snapshot before write", { cause: error })
+        throw new ReviewsError("storage_unavailable", `Failed to read reviews snapshot before write${describeCause(error)}`, { cause: error })
       }
 
       const outcome = await attemptOnce(fresh, attempt)

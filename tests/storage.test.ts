@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { BlobPreconditionFailedError } from "@vercel/blob"
+import { BlobError, BlobPreconditionFailedError } from "@vercel/blob"
 import { ReviewsError } from "../src/errors.js"
 import { createStorage } from "../src/storage.js"
 import { createEmptySnapshot } from "../src/reconcile.js"
@@ -661,6 +661,78 @@ describe("createStorage: leases", () => {
 
     await storage.removePendingTask("t1")
     expect(stored.metadata.pendingTasks).toHaveLength(0)
+  })
+})
+
+describe("createStorage: Blob 'already exists' (transient v3 read miss) — SJG-WEBSITE-5A", () => {
+  const ALREADY_EXISTS =
+    "Vercel Blob: This blob already exists, use `allowOverwrite: true` if you want to overwrite it. Or `addRandomSuffix: true` to generate a unique filename. Read more about this error in our documentation: https://vercel.link/blob-allow-overwrite"
+
+  function legacyBlob() {
+    return blobResult(
+      {
+        lastUpdated: NOW,
+        totalReviews: 1,
+        averageRating: 5,
+        reviews: [{ id: "legacy-1", author: "A", rating: 5, text: "Legacy", publishedAt: NOW, location: "Vineland" }],
+      },
+      '"legacy-etag"',
+    )
+  }
+
+  it("writeReconciled retries after a v3 read miss and commits with allowOverwrite + the fresh etag", async () => {
+    const deps = makeDeps()
+    const v3 = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    let v3Reads = 0
+    deps.get.mockImplementation(async (pathname: string) => {
+      if (pathname === "google-reviews/reviews.v3.json") {
+        v3Reads += 1
+        return v3Reads === 1 ? null : blobResult(v3, '"etag-v3"')
+      }
+      if (pathname === "google-reviews/reviews.json") return legacyBlob()
+      return null
+    })
+    deps.put.mockRejectedValueOnce(new BlobError(ALREADY_EXISTS)).mockResolvedValueOnce({ etag: '"etag-v3b"' })
+    const storage = createStorage(baseConfig(), deps)
+
+    const outcome = await storage.writeReconciled(batch("new"))
+
+    expect(outcome.written).toBe(true)
+    expect(deps.put).toHaveBeenCalledTimes(2)
+    const firstOpts = deps.put.mock.calls[0]![2] as { allowOverwrite: boolean; ifMatch?: string }
+    expect(firstOpts.allowOverwrite).toBe(false)
+    expect(firstOpts.ifMatch).toBeUndefined()
+    const secondOpts = deps.put.mock.calls[1]![2] as { allowOverwrite: boolean; ifMatch?: string }
+    expect(secondOpts).toMatchObject({ allowOverwrite: true, ifMatch: '"etag-v3"' })
+    // The second attempt reconciles against the real v3 snapshot, not the legacy-derived one.
+    const stored = JSON.parse(deps.put.mock.calls[1]![1] as string) as ReviewsSnapshot
+    expect(stored.reviews.map(r => r.id)).toEqual(["new"])
+  })
+
+  it("exhausts as storage_conflict_exhausted when the v3 read keeps missing", async () => {
+    const deps = makeDeps()
+    deps.get.mockImplementation(async (pathname: string) =>
+      pathname === "google-reviews/reviews.json" ? legacyBlob() : null,
+    )
+    deps.put.mockRejectedValue(new BlobError(ALREADY_EXISTS))
+    const storage = createStorage(baseConfig(), deps)
+
+    await expect(storage.writeReconciled(batch("new"))).rejects.toMatchObject({ code: "storage_conflict_exhausted" })
+    expect(deps.put).toHaveBeenCalledTimes(5)
+  })
+
+  it("keeps the underlying Blob error reachable as Error#cause on storage_unavailable", async () => {
+    const deps = makeDeps()
+    deps.get.mockResolvedValue(blobResult(createEmptySnapshot("Biz", LOCATIONS, NOW), '"etag-1"'))
+    const inner = new Error("service down")
+    deps.put.mockRejectedValue(inner)
+    const storage = createStorage(baseConfig(), deps)
+
+    const thrown = await storage.writeReconciled(batch("new")).catch((e: unknown) => e)
+    expect(thrown).toBeInstanceOf(ReviewsError)
+    expect((thrown as ReviewsError).cause).toBe(inner)
+    expect((thrown as ReviewsError).extra?.cause).toBe(inner)
+    expect((thrown as ReviewsError).message).toBe("Failed to write reviews snapshot: service down")
   })
 })
 
