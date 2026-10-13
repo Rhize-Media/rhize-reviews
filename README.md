@@ -11,19 +11,22 @@ adapter you're using (Next.js route handlers are the primary target below).
 ## Install
 
 Install the published package with an exact registry version. The latest published
-version at this change's preparation is `0.1.3`; source version `0.1.4` adds the
-Blob-read resilience described below and is awaiting release authorization.
+version is `0.1.4`, including the Blob-read resilience described below.
 
 ```json
 {
   "dependencies": {
-    "@rhize/reviews": "0.1.3"
+    "@rhize/reviews": "0.1.4"
   }
 }
 ```
 
-Upgrade the exact pin to `0.1.4` once that version is published. Keep consumers on
-registry versions rather than local tarball paths.
+Keep consumers on exact registry versions rather than local tarball paths.
+
+Release 0.1.4 was published from reviewed source `f9c4e2c` with the existing
+per-command npm credential after CI trusted publishing rejected access (run
+38442857760). Registry integrity matches the reviewed tarball; this release has
+no CI provenance attestation. Trusted-publisher authentication still needs repair.
 
 ## Blob display-read resilience (0.1.4)
 
