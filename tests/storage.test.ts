@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { BlobError, BlobPreconditionFailedError } from "@vercel/blob"
 import { ReviewsError } from "../src/errors.js"
 import { createStorage } from "../src/storage.js"
@@ -97,6 +97,7 @@ describe("createStorage: readFresh", () => {
       access: "private",
       useCache: false,
       headers: { "accept-encoding": "identity" },
+      abortSignal: expect.any(AbortSignal),
     })
     expect(fresh).toEqual({ snapshot: empty, etag: '"etag-1"', source: "v3" })
   })
@@ -319,6 +320,147 @@ describe("createStorage: readForDisplay", () => {
     await Promise.all([storage.readForDisplay(), storage.readForDisplay(), storage.readForDisplay()])
 
     expect(deps.get).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("createStorage: transient display reads", () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, "random").mockReturnValue(0)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it.each([429, 500, 502, 503, 504])("recovers a cold reader from HTTP %s without reporting an error", async status => {
+    const deps = makeDeps()
+    const cfg = baseConfig()
+    const snapshot = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    deps.get.mockRejectedValueOnce(new BlobError(`Failed to fetch blob: ${status} temporary failure`))
+      .mockResolvedValueOnce(blobResult(snapshot, '"etag-1"'))
+    const result = expect(createStorage(cfg, deps).readForDisplay()).resolves.toEqual(snapshot)
+    await vi.runAllTimersAsync()
+    await result
+    expect(deps.get).toHaveBeenCalledTimes(2)
+    expect(cfg.hooks.reportError).not.toHaveBeenCalled()
+    expect(deps.put).not.toHaveBeenCalled()
+  })
+
+  it("bounds attempts, coalesces concurrent retries, and permits later recovery", async () => {
+    const deps = makeDeps()
+    const cfg = baseConfig()
+    const error = new BlobError("Failed to fetch blob: 429 Too Many Requests")
+    deps.get.mockRejectedValue(error)
+    const storage = createStorage(cfg, deps)
+    const results = Promise.allSettled([storage.readForDisplay(), storage.readForDisplay(), storage.readForDisplay()])
+    await vi.runAllTimersAsync()
+    const failed = await results
+    expect(deps.get).toHaveBeenCalledTimes(3)
+    expect(cfg.hooks.reportError).toHaveBeenCalledTimes(1)
+    for (const result of failed) {
+      expect(result.status).toBe("rejected")
+      if (result.status === "rejected") {
+        expect(result.reason).toMatchObject({ code: "storage_unavailable", cause: error, extra: { attempts: 3 } })
+      }
+    }
+    deps.get.mockResolvedValueOnce(blobResult(createEmptySnapshot("Biz", LOCATIONS, NOW), '"etag-2"'))
+    await expect(storage.readForDisplay()).resolves.toMatchObject({ schemaVersion: 3 })
+    expect(deps.get).toHaveBeenCalledTimes(4)
+  })
+
+  it("preserves the previous snapshot and marks it stale after exhausting retries", async () => {
+    const deps = makeDeps()
+    const cfg = baseConfig()
+    const snapshot = createEmptySnapshot("Biz", LOCATIONS, NOW)
+    deps.get.mockResolvedValueOnce(blobResult(snapshot, '"etag-1"'))
+    const storage = createStorage(cfg, deps)
+    await storage.readForDisplay()
+    deps.get.mockRejectedValue(new BlobError("Failed to fetch blob: 503 Service Unavailable"))
+    const result = storage.readForDisplay()
+    await vi.runAllTimersAsync()
+    expect(await result).toEqual({ ...snapshot, readState: { stale: true, reason: "storage_unavailable" } })
+    expect(snapshot.readState).toBeUndefined()
+    expect(deps.get).toHaveBeenCalledTimes(4)
+    expect(cfg.hooks.reportError).toHaveBeenCalledTimes(1)
+    expect(cfg.hooks.reportError).toHaveBeenCalledWith(expect.objectContaining({ code: "storage_unavailable" }),
+      { operation: "readForDisplay" }, expect.objectContaining({ code: "storage_unavailable" }))
+  })
+
+  it.each([401, 403, 400, 404])("does not retry HTTP %s", async status => {
+    const deps = makeDeps()
+    const error = new BlobError(`Failed to fetch blob: ${status} permanent failure`)
+    deps.get.mockRejectedValue(error)
+    await expect(createStorage(baseConfig(), deps).readForDisplay()).rejects.toBe(error)
+    expect(deps.get).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not retry malformed JSON", async () => {
+    const deps = makeDeps()
+    deps.get.mockResolvedValue({ ...blobResult({}, '"etag-1"'), stream: new Response("not JSON").body })
+    await expect(createStorage(baseConfig(), deps).readForDisplay()).rejects.toBeInstanceOf(SyntaxError)
+    expect(deps.get).toHaveBeenCalledTimes(1)
+  })
+
+  it("recovers an actual fetch network failure", async () => {
+    const deps = makeDeps()
+    deps.get.mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(blobResult(createEmptySnapshot("Biz", LOCATIONS, NOW), '"etag-1"'))
+    const result = expect(createStorage(baseConfig(), deps).readForDisplay()).resolves.toMatchObject({ schemaVersion: 3 })
+    await vi.runAllTimersAsync()
+    await result
+    expect(deps.get).toHaveBeenCalledTimes(2)
+  })
+
+  it("aborts a stalled Blob read at its deadline and retries it", async () => {
+    const deps = makeDeps()
+    const controllers: AbortController[] = []
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController()
+      controllers.push(controller)
+      setTimeout(() => controller.abort(new DOMException("Read timed out", "TimeoutError")), ms)
+      return controller.signal
+    })
+    deps.get.mockImplementationOnce((_path, options) => new Promise((_resolve, reject) => {
+      options.abortSignal.addEventListener("abort", () => reject(options.abortSignal.reason), { once: true })
+    })).mockResolvedValueOnce(blobResult(createEmptySnapshot("Biz", LOCATIONS, NOW), '"etag-1"'))
+    const result = expect(createStorage(baseConfig(), deps).readForDisplay()).resolves.toMatchObject({ schemaVersion: 3 })
+    await vi.advanceTimersByTimeAsync(4999)
+    expect(deps.get).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(251)
+    await result
+    expect(controllers[0]?.signal.aborted).toBe(true)
+    expect(AbortSignal.timeout).toHaveBeenCalledWith(5000)
+    expect(deps.get).toHaveBeenCalledTimes(2)
+  })
+
+  it("also bounds a response body that stalls after headers arrive", async () => {
+    const deps = makeDeps()
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(new DOMException("Read timed out", "TimeoutError")), ms)
+      return controller.signal
+    })
+    deps.get.mockImplementationOnce((_path, options) => Promise.resolve({
+      ...blobResult({}, '"etag-1"'),
+      stream: new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"schemaVersion":'))
+        options.abortSignal.addEventListener("abort", () => controller.error(options.abortSignal.reason), { once: true })
+      } }),
+    })).mockResolvedValueOnce(blobResult(createEmptySnapshot("Biz", LOCATIONS, NOW), '"etag-2"'))
+    const result = expect(createStorage(baseConfig(), deps).readForDisplay()).resolves.toMatchObject({ schemaVersion: 3 })
+    await vi.advanceTimersByTimeAsync(5250)
+    await result
+    expect(deps.get).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not use display retries or stale data for reads before a write", async () => {
+    const deps = makeDeps()
+    deps.get.mockRejectedValue(new BlobError("Failed to fetch blob: 429 Too Many Requests"))
+    await expect(createStorage(baseConfig(), deps).writeReconciled(batch("new"))).rejects.toMatchObject({ code: "storage_unavailable" })
+    expect(deps.get).toHaveBeenCalledTimes(1)
+    expect(deps.put).not.toHaveBeenCalled()
   })
 })
 

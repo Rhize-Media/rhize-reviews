@@ -10,19 +10,45 @@ adapter you're using (Next.js route handlers are the primary target below).
 
 ## Install
 
-Until the registry release lands, consumers install the release candidate as a local
-tarball, pinned exactly:
+Install the published package with an exact registry version. The latest published
+version at this change's preparation is `0.1.3`; source version `0.1.4` adds the
+Blob-read resilience described below and is awaiting release authorization.
 
 ```json
 {
   "dependencies": {
-    "@rhize/reviews": "file:/Users/jamesdeola/dev-local/RHIZE/rhize-reviews/rhize-reviews-0.1.0-rc.1.tgz"
+    "@rhize/reviews": "0.1.3"
   }
 }
 ```
 
-Swap that for the published `"@rhize/reviews": "0.1.0"` from the registry once the
-package's final review has landed — that dependency diff is expected.
+Upgrade the exact pin to `0.1.4` once that version is published. Keep consumers on
+registry versions rather than local tarball paths.
+
+## Blob display-read resilience (0.1.4)
+
+`readSnapshot()` coalesces concurrent reads within a client instance. A transient
+private Blob 429, 500/502/503/504, Node fetch network failure, or read timeout gets
+up to **three attempts**, with jittered exponential delays of 250–500 ms and
+500–1000 ms. Every Blob GET has a **five-second abort deadline**, also covering
+response-body consumption. A fresh read can try the v3 and legacy paths, so each
+attempt can contain two GETs. Authentication/configuration errors, malformed
+JSON, missing blobs and unsupported schemas do not trigger transient retries.
+
+Recovered reads emit no error. Exhaustion reports one `storage_unavailable` error
+with the original cause and attempt count, then serves a stale copy of the last
+successful snapshot if this instance has one. A cold reader with no snapshot
+throws; it never reports an unavailable source as a successful empty snapshot.
+The in-flight promise is cleared after failure so a later call can recover.
+
+Fresh reads used by cron/CAS writes retain fresh-data-only semantics and do not
+use display retries or stale fallback; their Blob requests have the same abort
+deadline. Paid-provider calls and write-conflict retries are unchanged.
+
+This fixes the single-attempt read failure observed as SJG-WEBSITE-5K. It cannot
+supply old data on a cold instance during a sustained outage. Consumer caches
+remain responsible for keeping previously rendered data available across
+instances; no new durable cache or dependency is introduced here.
 
 ## Configuration
 

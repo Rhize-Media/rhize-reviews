@@ -12,6 +12,9 @@ import { isRecord } from "./util.js"
 const LEGACY_PATHNAME = "google-reviews/reviews.json"
 const MAX_CAS_ATTEMPTS = 5
 const BASE_RETRY_DELAY_MS = 25
+const MAX_DISPLAY_READ_ATTEMPTS = 3
+const DISPLAY_RETRY_DELAY_MS = 250
+const BLOB_READ_TIMEOUT_MS = 5_000
 
 type BlobGet = typeof get
 type BlobPut = typeof put
@@ -47,6 +50,16 @@ function isConflict(error: unknown): boolean {
     if (/already exists|blob-allow-overwrite/i.test(error.message)) return true
   }
   return false
+}
+
+function isTransientReadError(error: unknown): boolean {
+  if (error instanceof BlobError) {
+    return /Failed to fetch blob: (429|500|502|503|504)\b/.test(error.message)
+  }
+  return error instanceof Error && (
+    error.name === "AbortError" || error.name === "TimeoutError" ||
+    (error instanceof TypeError && error.message === "fetch failed")
+  )
 }
 
 function describeCause(error: unknown): string {
@@ -111,6 +124,7 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
       access: "private",
       useCache: false,
       headers: { "accept-encoding": "identity" },
+      abortSignal: AbortSignal.timeout(BLOB_READ_TIMEOUT_MS),
     })
     if (!result) return null
     const raw = await new Response(result.stream).json()
@@ -140,7 +154,21 @@ export function createStorage(cfg: ReviewsConfig, deps: StorageDeps = {}) {
 
     pendingDisplayRead = (async () => {
       try {
-        const fresh = await readFresh()
+        let fresh: FreshRead | null = null
+        for (let attempt = 0; attempt < MAX_DISPLAY_READ_ATTEMPTS; attempt += 1) {
+          try {
+            fresh = await readFresh()
+            break
+          } catch (error) {
+            if (!isTransientReadError(error)) throw error
+            if (attempt === MAX_DISPLAY_READ_ATTEMPTS - 1) {
+              throw new ReviewsError("storage_unavailable", "Exhausted transient Blob read retries", {
+                cause: error, attempts: MAX_DISPLAY_READ_ATTEMPTS,
+              })
+            }
+            await sleep(DISPLAY_RETRY_DELAY_MS * 2 ** attempt * (1 + Math.random()))
+          }
+        }
         if (fresh) {
           lastKnownSnapshot = fresh.snapshot
           return fresh.snapshot
